@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
   pull_request:
   workflow_dispatch:
 
@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +23,7 @@ jobs:
           node-version: 20
 
       - name: 安装依赖
-        run: npm install --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: 语法与模块检查
         run: node scripts/verify.mjs
@@ -40,6 +40,5 @@ jobs:
       - name: 生成配置（幂等）
         run: node src/index.js list
 
-      - name: dry-run（无浏览器环境下跳过平台执行，仅验证不崩溃）
-        run: node src/index.js run --dry-run --only=zhipu
-        continue-on-error: true
+      - name: 无账号回归测试（禁止真实签到或客户端重启）
+        run: npm test

@@ -14,7 +14,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "✗ 找不到 node。先安装 Node.js 18+（brew install node 或官方 pkg）。"
+  echo "✗ 找不到 node。先安装 Node.js 20+（brew install node 或官方 pkg）。"
   exit 1
 fi
 

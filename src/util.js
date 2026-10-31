@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -32,14 +33,21 @@ export function safeName(s) {
 export function readJSON(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
+  } catch (e) {
+    if (e.code === 'ENOENT') return fallback;
+    throw new Error(`无法读取 JSON 配置 ${file}: ${e.message}`, { cause: e });
   }
 }
 
 export function writeJSON(file, obj) {
   ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+  const temp = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(obj, null, 2) + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.renameSync(temp, file);
+  } finally {
+    if (fs.existsSync(temp)) fs.unlinkSync(temp);
+  }
 }
 
 /** 只保留最近 n 天的子目录（data/shots/2026-10-01/...） */

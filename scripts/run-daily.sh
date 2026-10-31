@@ -11,7 +11,7 @@ fi
 
 NODE_BIN="$(command -v node || true)"
 if [ -z "$NODE_BIN" ]; then
-  echo "找不到 node，请安装 Node.js 18+"
+  echo "找不到 node，请安装 Node.js 20+"
   exit 1
 fi
 

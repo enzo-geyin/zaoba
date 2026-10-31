@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadConfig, saveConfig, resolveAdapters } from './config.js';
@@ -24,6 +25,18 @@ const MIME = {
 
 const RUN_STATUS = new Set(['success', 'already']);
 const HISTORY_DAYS = 14;
+
+export function reportPath(root, date) {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+    throw Object.assign(new Error('日期必须是有效的 YYYY-MM-DD'), { status: 400 });
+  }
+  const dir = path.resolve(root, 'data/reports');
+  const file = path.resolve(dir, `${date}.md`);
+  if (path.dirname(file) !== dir) throw Object.assign(new Error('禁止读取日报目录以外的文件'), { status: 403 });
+  if (fs.existsSync(file) && path.dirname(fs.realpathSync(file)) !== fs.realpathSync(dir)) throw Object.assign(new Error('禁止跟随目录外符号链接'), { status: 403 });
+  return file;
+}
 
 function lastDates(n) {
   const out = [];
@@ -82,10 +95,9 @@ function expiryOf(id, last) {
 const loginState = { id: null, proc: null, status: 'idle', startedAt: null, code: null };
 
 /** 汇总前端需要的全部状态 */
-export function buildState() {
-  const cfg = loadConfig();
+export function buildState({ cfg = loadConfig({ createIfMissing: false }), records = readResultsJSONL(path.resolve('data/results.jsonl')) } = {}) {
   const adapters = resolveAdapters(cfg, { includeDisabled: true });
-  const records = readResultsJSONL(path.resolve('data/results.jsonl')).filter((r) => !r.dryRun);
+  records = records.filter((r) => !r.dryRun);
   const dates = lastDates(HISTORY_DAYS);
 
   // 每平台最新一条 + 最近 N 天矩阵
@@ -114,12 +126,15 @@ export function buildState() {
   const platforms = adapters.map((a) => {
     const list = (byPlatform.get(a.id) || []).slice().sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
     const last = list[list.length - 1] || null;
+    const lastWithMeta = list.findLast((r) => r.meta && RUN_STATUS.has(r.status));
     const matrix = {};
     for (const d of dates) {
       const dayRecords = list.filter((r) => r.date === d);
-      matrix[d] = dayRecords.length ? dayRecords[dayRecords.length - 1].status : null;
+      const completed = dayRecords.findLast((r) => RUN_STATUS.has(r.status));
+      matrix[d] = (completed || dayRecords.at(-1))?.status || null;
     }
-    const todayRec = list.filter((r) => r.date === today()).pop() || null;
+    const todayRecords = list.filter((r) => r.date === today());
+    const todayRec = todayRecords.findLast((r) => RUN_STATUS.has(r.status)) || todayRecords.at(-1) || null;
     const pc = cfg.platforms[a.id] || {};
     // 判定方式：config 里显式 type 优先；否则看是否是客户端接管类适配器
     const mode =
@@ -164,6 +179,8 @@ export function buildState() {
       last: last
         ? { date: last.date, ts: last.ts, status: last.status, detail: last.detail, meta: last.meta || null, durationMs: last.durationMs }
         : null,
+      lastVerifiedMeta: lastWithMeta?.meta || null,
+      lastVerifiedAt: lastWithMeta?.ts || null,
       todayStatus: todayRec ? todayRec.status : null,
       todayDetail: todayRec ? todayRec.detail : null,
       matrix,
@@ -177,10 +194,9 @@ export function buildState() {
   // 汇总：credits 取最近一次带 meta 的记录（WorkBuddy 累计）
   let totalCredits = null;
   let streak = null;
-  for (const p of platforms) {
-    if (p.last?.meta?.credits != null) totalCredits = p.last.meta.credits;
-    if (p.last?.meta?.streak != null) streak = p.last.meta.streak;
-  }
+  const wb = platforms.find((p) => p.id === 'workbuddy');
+  totalCredits = wb?.lastVerifiedMeta?.credits ?? null;
+  streak = wb?.lastVerifiedMeta?.streak ?? null;
 
   return {
     now: new Date().toISOString(),
@@ -236,6 +252,7 @@ export async function startServer({ port = 7788, logger } = {}) {
   const root = process.cwd();
   const webDir = path.join(root, 'web');
   const hub = new Set();
+  const sessionToken = randomBytes(32).toString('hex');
   let running = null; // 正在跑的 child process
   let clientsCache = { at: 0, data: null };
 
@@ -259,26 +276,45 @@ export async function startServer({ port = 7788, logger } = {}) {
   };
 
   const readBody = (req) =>
-    new Promise((resolve) => {
+    new Promise((resolve, reject) => {
+      if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) return reject(Object.assign(new Error('需要 application/json'), { status: 415 }));
       let data = '';
       req.on('data', (c) => {
         data += c;
-        if (data.length > 1e6) req.destroy();
+        if (Buffer.byteLength(data) > 65536) {
+          reject(Object.assign(new Error('请求体过大'), { status: 413 }));
+          req.destroy();
+        }
       });
       req.on('end', () => {
         try {
-          resolve(data ? JSON.parse(data) : {});
+          const body = data ? JSON.parse(data) : {};
+          if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('需要 JSON 对象');
+          resolve(body);
         } catch {
-          resolve({});
+          reject(Object.assign(new Error('无效的 JSON 对象'), { status: 400 }));
         }
       });
     });
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://127.0.0.1:${port}`);
+    const localPort = server.address()?.port || port;
+    const url = new URL(req.url, `http://127.0.0.1:${localPort}`);
     const p = url.pathname;
 
     try {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      const origins = [`http://127.0.0.1:${localPort}`, `http://localhost:${localPort}`];
+      if (!origins.some((o) => new URL(o).host === req.headers.host) ||
+          (req.headers.origin && !origins.includes(req.headers.origin)) || req.headers['sec-fetch-site'] === 'cross-site') {
+        return json(res, 403, { error: '禁止跨站或非本地请求' });
+      }
+      if (!['GET', 'HEAD'].includes(req.method)) {
+        const supplied = Buffer.from(String(req.headers['x-zaoba-token'] || ''));
+        const expected = Buffer.from(sessionToken);
+        if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return json(res, 403, { error: '缺少有效的本地会话令牌' });
+      }
+      if (p === '/api/session' && req.method === 'GET') return json(res, 200, { token: sessionToken });
       // ---------- API ----------
       if (p === '/api/state' && req.method === 'GET') {
         return json(res, 200, buildState());
@@ -286,15 +322,16 @@ export async function startServer({ port = 7788, logger } = {}) {
 
       if (p === '/api/report' && req.method === 'GET') {
         const date = url.searchParams.get('date') || today();
-        const file = path.resolve('data/reports', `${date}.md`);
+        const file = reportPath(root, date);
         if (!fs.existsSync(file)) return json(res, 404, { error: '没有这一天的报告' });
         return json(res, 200, { date, markdown: fs.readFileSync(file, 'utf8') });
       }
 
       if (p.startsWith('/api/login/') && req.method === 'POST') {
         const id = decodeURIComponent(p.slice('/api/login/'.length));
-        if (loginState.proc) {
-          return json(res, 409, { error: '已有登录窗口在等待，请先完成或关闭它' });
+        if (!resolveAdapters(loadConfig({ createIfMissing: false }), { includeDisabled: true, only: [id] }).length) return json(res, 400, { error: '未知平台' });
+        if (loginState.proc || running) {
+          return json(res, 409, { error: '已有签到或登录任务在运行，请先完成它' });
         }
         const child = spawn(process.execPath, [path.join('src', 'login-one.js'), id], {
           cwd: process.cwd(),
@@ -313,6 +350,7 @@ export async function startServer({ port = 7788, logger } = {}) {
         };
         child.stdout.on('data', relay);
         child.stderr.on('data', relay);
+        child.on('error', (e) => { loginState.proc = null; loginState.status = 'error'; logger2.error(e.message); });
         child.on('close', (code) => {
           loginState.proc = null;
           loginState.code = code;
@@ -331,7 +369,7 @@ export async function startServer({ port = 7788, logger } = {}) {
         if (!target) return json(res, 404, { error: '没找到这个平台的客户端，先点「去下载」安装' });
         try {
           if (platform.isMacOS) {
-            await execFile('open', [target], { timeout: 8000 });
+            await exec('open', [target], { timeout: 8000 });
           } else if (platform.isWindows) {
             const child = spawn(target, [], { detached: true, stdio: 'ignore', windowsHide: false });
             child.unref();
@@ -385,7 +423,8 @@ export async function startServer({ port = 7788, logger } = {}) {
         const body = await readBody(req);
         const cfg = loadConfig();
         if (!body.id || !cfg.platforms[body.id]) return json(res, 400, { error: '未知平台' });
-        cfg.platforms[body.id] = { ...cfg.platforms[body.id], enabled: !!body.enabled };
+        if (typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled 必须为布尔值' });
+        cfg.platforms[body.id] = { ...cfg.platforms[body.id], enabled: body.enabled };
         saveConfig(cfg);
         logger2.info(`平台 ${body.id} ${body.enabled ? '已启用' : '已停用'}`);
         broadcast({ type: 'state' });
@@ -393,12 +432,16 @@ export async function startServer({ port = 7788, logger } = {}) {
       }
 
       if (p === '/api/run' && req.method === 'POST') {
-        if (running) return json(res, 409, { error: '已有任务在运行，请等它结束' });
+        if (running || loginState.proc) return json(res, 409, { error: '已有签到或登录任务在运行，请等它结束' });
         const body = await readBody(req);
+        if (body.only !== undefined && (!Array.isArray(body.only) || body.only.some((id) => typeof id !== 'string' || !/^[a-z0-9_-]+$/i.test(id)))) return json(res, 400, { error: 'only 必须是平台 ID 数组' });
+        if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') return json(res, 400, { error: 'dryRun 必须为布尔值' });
         const only = Array.isArray(body.only) && body.only.length ? body.only : [];
         const dryRun = !!body.dryRun;
+        // readBody 是异步的，必须在 await 后再检查一次，避免两个并发请求同时通过。
+        if (running || loginState.proc) return json(res, 409, { error: '已有签到或登录任务在运行' });
 
-        const args = ['src/index.js', 'run'];
+        const args = ['src/index.js', 'run', '--skip-if-done'];
         if (only.length) args.push(`--only=${only.join(',')}`);
         if (dryRun) args.push('--dry-run');
 
@@ -422,6 +465,7 @@ export async function startServer({ port = 7788, logger } = {}) {
         pipe(child.stdout, 'info');
         pipe(child.stderr, 'error');
 
+        child.on('error', (e) => { running = null; broadcast({ type: 'run-end', code: 1 }); logger2.error(e.message); });
         child.on('close', (code) => {
           running = null;
           broadcast({ type: 'run-end', code });
@@ -469,7 +513,7 @@ export async function startServer({ port = 7788, logger } = {}) {
       fs.createReadStream(file).pipe(res);
     } catch (e) {
       logger2.error(`请求出错 ${req.method} ${p}: ${e.message}`);
-      if (!res.headersSent) json(res, 500, { error: String(e.message || e) });
+      if (!res.headersSent) json(res, e.status || 500, { error: String(e.message || e) });
       else res.end();
     }
   });

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { chromium } from 'playwright';
 import platform from '../platform.js';
-import { sleep } from '../util.js';
+import { abortableSleep, guardPage } from '../runtime.js';
 import { findClickables, clickByKeywords, pageText, classifyOutcome, detectLogin, screenshot } from '../dom.js';
 
 /**
@@ -65,16 +65,20 @@ async function gracefulQuitApp(pc, execPath, logger) {
   return platform.gracefulQuit({ appName, execPath, logger });
 }
 
-async function quitApp(pid, execPath, logger) {
+async function quitApp(child, execPath, logger) {
   try {
-    await platform.gracefulQuit({ execPath, logger });
-    logger?.step('已关闭客户端');
+    await platform.quitOwnedProcess(child, logger);
   } catch (e) {
     logger?.warn(`关闭客户端失败（忽略）: ${String(e.message).split('\n')[0]}`);
   }
 }
 
-export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun = false } = {}) {
+export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun = false, allowRestart = false, signal, onAbort = () => {} } = {}) {
+  const sleep = (ms) => abortableSleep(ms, signal);
+  signal?.throwIfAborted();
+  if (pc.jsEval && cfg?.security?.allowJsEval !== true) {
+    return { status: 'needs_manual', detail: 'jsEval 默认禁用；确认脚本可信后，显式配置 security.allowJsEval: true' };
+  }
   const port = Number(pc.port || 9445);
   const appOrBin = pc.app || pc.bin;
   if (appOrBin && platform.isMacOS && !fs.existsSync(appOrBin)) {
@@ -93,16 +97,20 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
   const wasRunningAtStart = await asynIsRunning(execPath);
 
   if (!version) {
+    if (dryRun) return { status: 'needs_manual', detail: `演练不会启动或重启客户端；请先手动开启调试端口 ${port}` };
     if (wasRunningAtStart) {
-      if (!pc.autoRestart) {
+      if (!pc.autoRestart || !allowRestart) {
         return {
           status: 'needs_manual',
-          detail: `客户端正在运行但没有开启调试端口 ${port}。请先退出它，再重跑（或在 config 里设 autoRestart: true）`,
+          detail: `客户端正在运行但没有开启调试端口 ${port}。请先退出它，再重跑（保存工作后可配置 autoRestart: true 并在本次命令加 --allow-restart）`,
         };
       }
       // autoRestart：优雅退出后带调试端口重启，签完保持运行（恢复你的使用状态）
       logger?.info(`${pc.name || '客户端'} 在运行但无调试端口，自动重启一次以开启接管`);
-      await gracefulQuitApp(pc, execPath, logger);
+      if (!(await gracefulQuitApp(pc, execPath, logger))) {
+        return { status: 'needs_manual', detail: '客户端没有正常退出，已停止重启，不会强制结束进程' };
+      }
+      signal?.throwIfAborted();
     }
 
     const env = { ...process.env };
@@ -116,10 +124,13 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
       args.push(`--remote-debugging-port=${port}`);
     }
 
+    signal?.throwIfAborted();
     logger?.info(`启动 ${pc.name || '客户端'}（端口 ${port}）`);
     const child = spawn(execPath, args, { detached: true, stdio: 'ignore', env });
     child.unref();
-    launchedPid = child.pid;
+    launchedPid = child;
+    child.on('error', (e) => logger?.warn(`客户端启动失败: ${e.message}`));
+    onAbort(() => !wasRunningAtStart && quitAfter ? quitApp(child, execPath, logger) : undefined);
 
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
@@ -137,6 +148,7 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
   }
 
   // 2) 连进去
+  signal?.throwIfAborted();
   let browser;
   try {
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 20000 });
@@ -145,22 +157,27 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
     return { status: 'error', detail: `连接 CDP 失败: ${String(e.message).split('\n')[0]}` };
   }
 
+  onAbort(() => browser.close().catch(() => null));
   let page;
+  let ownedPage;
 
   try {
+    signal?.throwIfAborted();
     // 3) 选页面（必要时用客户端登录态新开一个网页）
     const pages = browser.contexts().flatMap((c) => c.pages());
     logger?.step(`发现 ${pages.length} 个页面`);
 
     if (pc.openUrl) {
-      page = await browser.contexts()[0].newPage();
+      ownedPage = await browser.contexts()[0].newPage();
+      page = guardPage(ownedPage, signal);
       await page.goto(pc.openUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       // 任务/活动面板是异步渲染的，尽量等它稳定
       await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
       await sleep(2500);
     } else {
-      page = (pc.pageUrlMatch && pages.find((p) => p.url().includes(pc.pageUrlMatch))) || pages[0];
-      if (!page) return { status: 'error', detail: '没找到可操作的页面' };
+      const target = pc.pageUrlMatch ? pages.find((p) => p.url().includes(pc.pageUrlMatch)) : pages[0];
+      if (!target) return { status: 'error', detail: '没找到匹配的主界面，已停止，避免操作其它窗口' };
+      page = guardPage(target, signal);
     }
 
     // 3.4) 等界面真正渲染完（冷启动的 VS Code 系客户端常常还是空白）
@@ -181,7 +198,7 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
       if (menuAlreadyOpen) logger?.step('前置菜单已是打开状态，跳过点击');
     }
 
-    if (Array.isArray(pc.beforeClickSelectors) && pc.beforeClickSelectors.length && !menuAlreadyOpen) {
+    if (!dryRun && Array.isArray(pc.beforeClickSelectors) && pc.beforeClickSelectors.length && !menuAlreadyOpen) {
       let clickedMenu = false;
       for (let attempt = 0; attempt < 3 && !clickedMenu; attempt++) {
         for (const sel of pc.beforeClickSelectors) {
@@ -311,9 +328,10 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
   } catch (e) {
     return { status: 'error', detail: String(e.message || e).split('\n')[0] };
   } finally {
-    if (page && shotDir) await screenshot(page, shotDir, shotName || 'client').catch(() => null);
+    if (!signal?.aborted && page && shotDir) await screenshot(page, shotDir, shotName || 'client').catch(() => null);
+    if (ownedPage) await ownedPage.close().catch(() => null);
     try {
-      browser.close?.();
+      await browser.close?.();
     } catch {
       /* ignore */
     }

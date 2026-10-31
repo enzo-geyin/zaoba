@@ -1,5 +1,18 @@
 # 早八（zaoba）
 
+## 本 fork 的首批安全修复
+
+- 来源保留：本项目复刻自 BorisSun0424-boop/zaoba，遵循原 MIT 许可证。
+- 桌面演练不启动/重启客户端、不点击菜单或领取按钮；网页演练不主动领取，但访问平台页面本身仍可能触发其登录积分。
+- WorkBuddy 仍采用状态查询 → 内部领取通道 → 回读确认，不依赖领取弹窗；状态无效时停止，不自动重启正在使用的客户端。
+- 通用客户端默认不自动重启。确需重启时，先保存工作，配置 `autoRestart: true`，并在本次命令加 `--allow-restart`；只请求正常退出，失败即停止，绝不强杀。
+- 所有 CLI 签到/登录/探测入口共享 `data/.task.lock`；异常退出遗留锁须先核实原任务已结束再人工处理，不按超时自动删锁。
+- 控制台写接口需先 `GET /api/session` 获取本地会话令牌，再发送 `X-Zaoba-Token`；JSON 接口要求 `Content-Type: application/json`。令牌不能隔离同一用户下的恶意本机进程。
+- `jsEval` 默认禁用；只有核验可信后，才可显式设置 `security.allowJsEval: true`。
+- Node.js 要求统一为 20+，Playwright 锁定 1.64.1。运行 `npm test` 执行无真实账号的回归测试；CI 覆盖 macOS / Windows / Linux。
+- 超时会阻止后续动作、关闭脚本页面/断开调试连接并等待清理；无法撤回服务端已经收到的领取请求。
+- 以下上游说明保留供参考；发生冲突时以上述安全规则和当前源码为准。
+
 [![CI](https://github.com/BorisSun0424-boop/zaoba/actions/workflows/ci.yml/badge.svg)](https://github.com/BorisSun0424-boop/zaoba/actions/workflows/ci.yml)
 
 > 每天 8:00，替你领额度。
@@ -34,11 +47,11 @@ Playwright 持久化登录态 + launchd 定时，**装好后不用再管**。
 
 | 方式 | 适合谁 | 怎么做 |
 | --- | --- | --- |
-| **交给 AI Agent** | 不想碰终端 | 复制 [docs/AGENT-PROMPT.md](./docs/AGENT-PROMPT.md) 里的指令给你的 Agent，它负责装 Node ≥18、依赖、浏览器内核、定时任务 |
+| **交给 AI Agent** | 不想碰终端 | 复制 [docs/AGENT-PROMPT.md](./docs/AGENT-PROMPT.md) 里的指令给你的 Agent，它负责装 Node ≥20、依赖、浏览器内核、定时任务 |
 | **一键脚本** | 有终端经验 | `bash scripts/bootstrap.sh`（先 `--check` 自检，加 `--with-service` 装定时任务） |
 | **手动命令** | 想完全掌控 | 见 [docs/INSTALL.md](./docs/INSTALL.md) |
 
-前置条件：macOS 12+、**Node.js ≥ 18**、约 1.5GB 磁盘（依赖 + 570MB 浏览器内核）、macOS 已登录状态。
+前置条件：macOS 12+、**Node.js ≥ 20**、约 1.5GB 磁盘（依赖 + 570MB 浏览器内核）、macOS 已登录状态。
 
 ## 一分钟上手
 
@@ -116,7 +129,7 @@ Windows：安装脚本创建的计划任务已带上 **「唤醒计算机运行�
 ```
 帮我在这台电脑上安装 https://github.com/BorisSun0424-boop/zaoba
 先读仓库里的 docs/AGENT-PROMPT.md，按里面的步骤做：
-1. 检查系统（macOS / Windows）和 Node ≥18
+1. 检查系统（macOS / Windows）和 Node ≥20
 2. 缺 Node 就装（Windows 用 winget，mac 用 brew 或官方 pkg）
 3. 安装依赖与浏览器内核
 4. 跑 bash scripts/bootstrap.sh --check（Windows：bootstrap.ps1 -Check）
@@ -423,7 +436,7 @@ npm run checkin -- --only=trae --headed   # 只跑这一个，确认结果
 | `timeout` | 站点慢 | 调大 `platformTimeout` |
 | `uncertain` | 点了但页面无明确提示 | 看截图确认，成功的话把提示文案加进 `doneKeywords` |
 | 定时任务没跑 | 电脑在设定时间休眠 | macOS 唤醒后会补跑；先手动 `CHECKIN_NO_DELAY=1 bash scripts/run-daily.sh` 验证 |
-| `Profile 被占用` | 有残留进程或两实例争抢 | 脚本用 `data/.run.lock` 防并发；残留时 `pkill -f "zaoba/profile"` |
+| `Profile 被占用` | 有残留进程或两实例争抢 | 所有入口共享 `data/.task.lock`；先确认原任务及其浏览器已结束，不要按路径批量强杀 |
 
 ### 运行记录（本机真实跑出来的）
 

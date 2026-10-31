@@ -13,6 +13,7 @@ import { getSchedule, applySchedule, readEffectiveSchedule, installSchedule, rem
 import { webCommand } from './server.js';
 import { statusIcon, readResultsJSONL } from './notify.js';
 import { today } from './util.js';
+import { acquireTaskLock } from './task-lock.js';
 
 const HELP = `
 早八 zaoba · 每天 8:30 替你领额度（详见 README.md / RESEARCH.md）
@@ -51,6 +52,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--date=')) out.date = a.slice(7);
     else if (a === '--quiet') out.quiet = true;
     else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--allow-restart') out.allowRestart = true;
     else if (a === '--skip-if-done') out.skipIfDone = true;
     else if (a === '--force') out.skipIfDone = false;
     else if (a.startsWith('--probe=')) out.probe = a.slice(8);
@@ -90,6 +92,8 @@ function reportCommand(cfg, args) {
 async function main() {
   const cmd = (process.argv[2] || 'run').toLowerCase();
   const args = parseArgs(process.argv.slice(3));
+  // 进程退出统一释放；登录助手的 process.exit 也能释放同一把锁。
+  if (['run', 'dry-run', 'login', 'probe'].includes(cmd) || (cmd === 'clients' && args.probe)) acquireTaskLock();
   const cfg = loadConfig();
 
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') {
@@ -216,22 +220,24 @@ async function main() {
       }
     }
 
+    let pendingOnly = args.only;
     if (args.skipIfDone && !dryRun) {
       const st = alreadyDoneToday(cfg, { only: args.only });
       if (st.allDone) {
         logger.info(`今天（${today()}）${st.total} 个平台已全部完成，跳过本次运行`);
         return;
       }
+      pendingOnly = st.pending.map((a) => a.id);
       if (st.doneCount > 0) logger.info(`今天已完成 ${st.doneCount}/${st.total}，继续处理剩下的 ${st.pending.map((a) => a.name).join('、')}`);
     }
 
     // 全部都是 standalone（如客户端类签到）时，没必要启动 Chromium
-    const needBrowser = resolveAdapters(cfg, { only: args.only }).some((a) => !a.standalone);
+    const needBrowser = resolveAdapters(cfg, { only: pendingOnly }).some((a) => !a.standalone && !a.unsupported);
     let ctx = null;
     if (needBrowser) ctx = await launchContext(cfg, { headless: args.headed ? false : cfg.headless, logger });
     let results = [];
     try {
-      results = await runAll(ctx, cfg, { logger, only: args.only, dryRun });
+      results = await runAll(ctx, cfg, { logger, only: pendingOnly, dryRun, skipIfDone: args.skipIfDone, allowRestart: args.allowRestart });
     } finally {
       if (ctx) await ctx.close().catch(() => null);
     }

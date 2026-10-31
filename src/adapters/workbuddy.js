@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { chromium } from 'playwright';
 import platform from '../platform.js';
 import { defineAdapter } from './base.js';
-import { sleep } from '../util.js';
+import { abortableSleep, guardPage } from '../runtime.js';
 
 /**
  * 腾讯 WorkBuddy（桌面客户端）—— 签到在客户端里，网页没有。
@@ -59,18 +59,20 @@ async function launchWithDebug(port, logger, execPath) {
   logger.info(`启动 WorkBuddy 客户端（CDP 端口 ${port}）`);
   const child = spawn(execPath, [], { detached: true, stdio: 'ignore', env });
   child.unref();
-  return child.pid;
+  child.on('error', (e) => logger.warn(`WorkBuddy 启动失败: ${e.message}`));
+  return child;
 }
 
-async function waitForCdp(port, logger, timeoutMs = 90000) {
+async function waitForCdp(port, logger, timeoutMs = 90000, signal) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
+    signal?.throwIfAborted();
     const v = await cdpVersion(port);
     if (v) {
       logger.info(`CDP 就绪: ${v.Browser}`);
       return true;
     }
-    await sleep(1500);
+    await abortableSleep(1500, signal);
   }
   return false;
 }
@@ -78,14 +80,7 @@ async function waitForCdp(port, logger, timeoutMs = 90000) {
 /** 优雅退出客户端（只在我们自己拉起来的时候做） */
 async function quitApp(pid, logger, execPath) {
   try {
-    if (execPath) await platform.gracefulQuit({ appName: 'WorkBuddy', execPath, logger });
-    else if (pid) {
-      try {
-        process.kill(pid, 'SIGTERM');
-      } catch {
-        /* ignore */
-      }
-    }
+    await platform.quitOwnedProcess(pid, logger);
     logger.step('已关闭 WorkBuddy 客户端');
   } catch (e) {
     logger.warn(`关闭客户端失败（忽略）: ${String(e.message).split('\n')[0]}`);
@@ -108,7 +103,9 @@ export default defineAdapter({
   timeout: 240000,
   notes: '签到在桌面客户端内（每日 100 Credits）；脚本会自动启动客户端 → 调内部接口 → 退出。',
 
-  custom: async ({ logger, cfg, dryRun = false }) => {
+  custom: async ({ logger, cfg, dryRun = false, signal, onAbort = () => {} }) => {
+    const sleep = (ms) => abortableSleep(ms, signal);
+    signal?.throwIfAborted();
     const pc = cfg.platforms?.workbuddy || {};
     const execPath = workbuddyBin(cfg);
     const port = Number(pc.cdpPort || DEFAULT_PORT);
@@ -121,6 +118,7 @@ export default defineAdapter({
     let version = await cdpVersion(port);
 
     if (!version) {
+      if (dryRun) return { status: 'needs_manual', detail: `演练不会启动或重启 WorkBuddy；请先手动开启调试端口 ${port}` };
       if (execPath && (await isAppRunning(execPath))) {
         // 客户端在跑但没开调试端口：不能强杀用户正在用的窗口
         return {
@@ -132,7 +130,8 @@ export default defineAdapter({
         };
       }
       launchedPid = await launchWithDebug(port, logger, execPath);
-      if (!(await waitForCdp(port, logger))) {
+      onAbort(() => quitAfter ? quitApp(launchedPid, logger, execPath) : undefined);
+      if (!(await waitForCdp(port, logger, 90000, signal))) {
         await quitApp(launchedPid, logger, execPath);
         return { status: 'error', detail: '客户端已启动但 CDP 端口没起来（90s 超时）' };
       }
@@ -142,6 +141,7 @@ export default defineAdapter({
     }
 
     // 2) 接管渲染进程
+    signal?.throwIfAborted();
     let browser;
     try {
       browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 20000 });
@@ -150,11 +150,14 @@ export default defineAdapter({
       return { status: 'error', detail: `连接 CDP 失败: ${String(e.message).split('\n')[0]}` };
     }
 
+    onAbort(() => browser.close().catch(() => null));
     try {
+      signal?.throwIfAborted();
       const pages = browser.contexts().flatMap((c) => c.pages());
       logger.step(`发现 ${pages.length} 个页面`);
-      const page = pages.find((p) => p.url().includes('renderer/index.html')) || pages[0];
-      if (!page) return { status: 'error', detail: '没找到 WorkBuddy 主窗口' };
+      const target = pages.find((p) => p.url().includes('renderer/index.html'));
+      if (!target) return { status: 'error', detail: '没找到 WorkBuddy 主窗口，已停止，避免操作其它窗口' };
+      const page = guardPage(target, signal);
 
       // 等 bridge 就绪（首次启动窗口渲染需要几秒）
       await page.waitForFunction(() => window.wb && typeof window.wb.invoke === 'function', null, { timeout: 45000 });
@@ -162,6 +165,9 @@ export default defineAdapter({
       // 3) 读状态（幂等保护：今天签过就不再请求）
       const rawBefore = await page.evaluate(() => window.wb.invoke('auth:getCheckinStatus'));
       const before = pickStatus(rawBefore);
+      if (typeof before.active !== 'boolean' || typeof before.today_checked_in !== 'boolean') {
+        return { status: 'needs_manual', detail: '签到状态缺少有效字段；请检查登录或客户端版本，未尝试领取或重启' };
+      }
       Object.assign(meta, {
         streak: before.streak_days,
         credits: before.total_credits,
@@ -230,7 +236,7 @@ export default defineAdapter({
     } finally {
       // 只断开 CDP 连接，不杀掉用户可能正在用的客户端
       try {
-        browser.close?.();
+        await browser.close?.();
       } catch {
         /* ignore */
       }

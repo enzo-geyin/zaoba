@@ -9,7 +9,7 @@ $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Url = 'http://127.0.0.1:7788'
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Host "✗ 找不到 node，请先安装 Node.js 18+" -ForegroundColor Red
+  Write-Host "✗ 找不到 node，请先安装 Node.js 20+" -ForegroundColor Red
   exit 1
 }
 $nodeBin = (Get-Command node).Source

@@ -13,13 +13,13 @@ Write-Host "早八 zaoba · 安装 Windows 定时任务" -ForegroundColor Cyan
 Write-Host "项目目录: $ProjectDir"
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Host "✗ 找不到 node。请先安装 Node.js 18+：https://nodejs.org/" -ForegroundColor Red
+  Write-Host "✗ 找不到 node。请先安装 Node.js 20+：https://nodejs.org/" -ForegroundColor Red
   exit 1
 }
 
 $nodeVersion = (node -v) -replace 'v', ''
 $major = [int]($nodeVersion.Split('.')[0])
-if ($major -lt 18) {
+if ($major -lt 20) {
   Write-Host "✗ Node 版本过低（$nodeVersion），需要 >= 18" -ForegroundColor Red
   exit 1
 }

@@ -21,7 +21,7 @@
 | 项目 | 要求 | 说明 |
 | --- | --- | --- |
 | 系统 | macOS 12+ | Apple Silicon 最佳；Intel 可用但客户端类平台较慢 |
-| 运行时 | **Node.js ≥ 18** | 核心依赖；用 `node -v` 检查 |
+| 运行时 | **Node.js ≥ 20** | 核心依赖；用 `node -v` 检查 |
 | 磁盘 | ≥ 1.5GB | 依赖约 100MB + Chromium 内核约 570MB |
 | 网络 | 可访问 nodejs.org / npm / 各平台站点 | 首次安装需要 |
 | 系统状态 | **已登录 macOS 桌面会话** | 定时任务属于用户会话，停在登录界面不会跑 |
@@ -79,7 +79,7 @@ bash scripts/bootstrap.sh --with-service
 ### 方式 C：手动命令（完全掌控每一步）
 
 ```bash
-# 1) Node ≥18（三选一）
+# 1) Node ≥20（三选一）
 brew install node                                  # 有 Homebrew
 # 或
 curl -fLO https://nodejs.org/dist/v22.14.0/node-v22.14.0.pkg && sudo installer -pkg node-v22.14.0.pkg -target /

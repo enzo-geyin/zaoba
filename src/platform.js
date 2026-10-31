@@ -115,50 +115,43 @@ export async function isProcessRunning(execPath) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * 优雅退出：一级一级升级，最后兜底强杀。
- * macOS: osascript quit → SIGTERM → SIGKILL
- * Windows: taskkill（不带 /F，等同关闭窗口）→ taskkill /F
- */
-export async function gracefulQuit({ appName, execPath, logger, waitMs = 20000 } = {}) {
+/** 请求正常退出；用户取消或客户端繁忙时停止，绝不升级为强制结束。 */
+export async function gracefulQuit({ appName, execPath, logger, waitMs = 8000 } = {}) {
   const running = () => isProcessRunning(execPath);
   if (!(await running())) return true;
-
-  const name = isWindows ? path.basename(execPath || '').replace(/\.exe$/i, '') : '';
-
-  // 第一级：礼貌请求退出
   if (isMacOS) {
     const target = appName || (execPath || '').match(/([^/]+)\.app\//)?.[1] || '';
-    if (target) await exec('osascript', ['-e', `quit app "${target}"`]).catch(() => null);
-  } else if (isWindows && name) {
-    await exec('taskkill', ['/IM', `${name}.exe`, '/T'], { timeout: 10000 }).catch(() => null);
+    if (!target) return false;
+    const escaped = target.replace(/["\\]/g, '\\$&');
+    await exec('osascript', ['-e', `quit app "${escaped}"`], { timeout: waitMs }).catch(() => null);
+  } else if (isWindows) {
+    const name = path.basename(execPath || '').replace(/\.exe$/i, '').replace(/'/g, "''");
+    await exec('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      `Get-Process -Name '${name}' -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() }`,
+    ], { timeout: waitMs }).catch(() => null);
+  } else {
+    return false;
   }
-  for (let i = 0; i < 16; i++) {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
     if (!(await running())) return true;
-    await sleep(500);
+    await sleep(250);
   }
+  logger?.warn('客户端未正常退出，已停止重启；不会强制结束，请先保存工作后手动退出');
+  return false;
+}
 
-  // 第二级：SIGTERM（mac）/ 强制结束（win）
-  logger?.warn('优雅退出未完成，升级为强制结束');
-  if (isMacOS) await exec('pkill', ['-f', execPath]).catch(() => null);
-  else if (isWindows && name) await exec('taskkill', ['/F', '/IM', `${name}.exe`, '/T'], { timeout: 10000 }).catch(() => null);
-  for (let i = 0; i < 12; i++) {
-    if (!(await running())) return true;
-    await sleep(500);
+/** 只清理本次 spawn 的进程句柄，不使用应用名或路径批量杀进程。 */
+export async function quitOwnedProcess(child, logger) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (isWindows) {
+    await exec('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      `$p = Get-Process -Id ${Number(child.pid)} -ErrorAction SilentlyContinue; if ($p) { [void]$p.CloseMainWindow() }`,
+    ], { timeout: 5000 }).catch(() => null);
+  } else {
+    child.kill('SIGTERM');
   }
-
-  // 第三级：按 bundle 目录整体清理（mac）/ 再强制一次（win）
-  if (isMacOS) {
-    const bundleDir = execPath.includes('.app/Contents/') ? execPath.slice(0, execPath.indexOf('.app/Contents/') + 4) : '';
-    if (bundleDir) await exec('pkill', ['-9', '-f', `${bundleDir}/Contents`]).catch(() => null);
-    else await exec('pkill', ['-9', '-f', execPath]).catch(() => null);
-    for (let i = 0; i < 10; i++) {
-      if (!(await running())) return true;
-      await sleep(500);
-    }
-  }
-  logger?.warn('进程仍在运行，后续可能因单实例锁失败');
-  return !(await running());
+  logger?.step(`已请求关闭本次启动的客户端 PID ${child.pid}（不强制结束）`);
 }
 
 /* ------------------------------------------------------------------ *
@@ -425,6 +418,7 @@ export default {
   pickAppPath,
   isProcessRunning,
   gracefulQuit,
+  quitOwnedProcess,
   notify,
   installScheduler,
   removeScheduler,

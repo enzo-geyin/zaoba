@@ -29,11 +29,11 @@ if ($Check) { Write-Host "模式: 仅检查" } else { Write-Host "模式: 完整
 Step 1 "系统环境"
 Ok "$([System.Environment]::OSVersion.VersionString) / $env:PROCESSOR_ARCHITECTURE"
 
-Step 2 "Node.js >= 18"
+Step 2 "Node.js >= 20"
 if (Get-Command node -ErrorAction SilentlyContinue) {
   $v = (node -v) -replace 'v',''
   $major = [int]($v.Split('.')[0])
-  if ($major -ge 18) { Ok "node v$v" } else { Warn "node v$v 版本过低" ; Fail "需要 Node >= 18：https://nodejs.org/" }
+  if ($major -ge 20) { Ok "node v$v" } else { Warn "node v$v 版本过低" ; Fail "需要 Node >= 20：https://nodejs.org/" }
 } else {
   Fail "未安装 Node.js。请从 https://nodejs.org/ 下载 LTS（安装时勾选 Add to PATH），然后重开 PowerShell"
 }

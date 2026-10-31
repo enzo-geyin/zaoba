@@ -51,16 +51,16 @@ if [ "$ARCH" != "arm64" ]; then
 fi
 
 # ---------------------------------------------------------------- 2. Node
-step 2 "Node.js ≥ 18"
+step 2 "Node.js ≥ 20"
 NODE_OK=0
 if command -v node >/dev/null 2>&1; then
   NODE_RAW="$(node -v | sed 's/^v//')"
   NODE_MAJOR="${NODE_RAW%%.*}"
-  if [ "${NODE_MAJOR:-0}" -ge 18 ] 2>/dev/null; then
+  if [ "${NODE_MAJOR:-0}" -ge 20 ] 2>/dev/null; then
     ok "node v${NODE_RAW}（$(command -v node)）"
     NODE_OK=1
   else
-    warn "当前 node v$NODE_RAW 版本过低（需要 ≥18）"
+    warn "当前 node v$NODE_RAW 版本过低（需要 ≥20）"
   fi
 else
   warn "没有找到 node"
@@ -68,7 +68,7 @@ fi
 
 if [ "$NODE_OK" = 0 ]; then
   if [ "$CHECK_ONLY" = 1 ]; then
-    fail "需要安装 Node ≥18（见下方命令）"
+    fail "需要安装 Node ≥20（见下方命令）"
   elif command -v brew >/dev/null 2>&1; then
     echo "  → 用 Homebrew 安装（可能需要几分钟）"
     if brew install node; then
@@ -85,7 +85,7 @@ if [ "$NODE_OK" = 0 ]; then
   if [ "$NODE_OK" = 0 ]; then
     cat <<'NODEHELP'
 
-  请任选一种方式安装 Node ≥18：
+  请任选一种方式安装 Node ≥20：
 
   A) 有 Homebrew：
        brew install node

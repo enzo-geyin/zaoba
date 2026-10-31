@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import platform from './platform.js';
+import { readJSON, writeJSON } from './util.js';
 
 const PROJECT_DIR = process.cwd();
 
@@ -20,11 +21,9 @@ export function normalizeTime(input) {
 /** 读取原始 config.json（不合并默认值，避免把大量默认项写回去） */
 export function readRawConfig() {
   const file = path.join(PROJECT_DIR, 'config.json');
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return {};
-  }
+  const raw = readJSON(file, {});
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config.json 必须是 JSON 对象');
+  return raw;
 }
 
 export function getSchedule() {
@@ -32,7 +31,7 @@ export function getSchedule() {
   const s = raw.schedule || {};
   return {
     time: normalizeTime(s.time) || '08:00',
-    retryTime: normalizeTime(s.retryTime) || '12:30',
+    retryTime: s.retryTime === '' || s.retryTime === null ? '' : normalizeTime(s.retryTime) || '12:30',
     randomDelayMinutes: Number.isFinite(Number(s.randomDelayMinutes)) ? Number(s.randomDelayMinutes) : 5,
   };
 }
@@ -63,7 +62,7 @@ export function saveSchedule(patch) {
   }
 
   raw.schedule = next;
-  fs.writeFileSync(path.join(PROJECT_DIR, 'config.json'), JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  writeJSON(path.join(PROJECT_DIR, 'config.json'), raw);
   return getSchedule();
 }
 

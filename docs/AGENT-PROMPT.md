@@ -31,15 +31,15 @@
   · Windows：执行 `systeminfo | findstr /C:"OS Version"` 与 `$env:PROCESSOR_ARCHITECTURE`
 - 后续命令按系统选择：macOS 用 `bash scripts/*.sh`，Windows 用
   `powershell -ExecutionPolicy Bypass -File scripts\*.ps1`
-- 执行 node -v，判断是否 ≥18
+- 执行 node -v，判断是否 ≥20
 - 检查磁盘剩余空间（需要约 1.5GB）
 
-### 步骤 2：安装 Node.js ≥18（如果缺失或版本过低）
+### 步骤 2：安装 Node.js ≥20（如果缺失或版本过低）
 按以下优先级选一种，并在执行前告诉我你选了哪种：
   A) 若存在 brew：brew install node
   B) 若无 brew：从 https://nodejs.org 下载 .pkg（先查最新 LTS 版本号），然后用 sudo installer -pkg ... -target /（执行前必须征得我同意）
   C) 若我不想用 sudo：用 nvm（curl 安装脚本 → nvm install --lts）
-装完执行 node -v 验证，并确认 ≥18。
+装完执行 node -v 验证，并确认 ≥20。
 
 ### 步骤 3：获取代码
 - 如果我已经把项目放在本地，问我路径后 cd 进去
@@ -95,7 +95,7 @@ Agent 完成后应该给出类似结论：
 
 ```
 已安装：
-  · Node v24.x（满足 ≥18）
+  · Node v24.x（满足 ≥20）
   · 依赖 + Playwright Chromium（约 570MB）
   · 定时任务：每天 08:00 / 12:30（已签跳过）
   · 本地控制台：http://127.0.0.1:7788

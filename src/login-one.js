@@ -12,6 +12,8 @@ import { loadConfig, resolveAdapters } from './config.js';
 import { pageText } from './dom.js';
 import { createLogger } from './logger.js';
 import { sleep } from './util.js';
+import { acquireTaskLock } from './task-lock.js';
+acquireTaskLock();
 
 const MAX_MINUTES = 10;
 const logger = createLogger('login');

@@ -2,6 +2,26 @@
 
 const $ = (sel) => document.querySelector(sel);
 
+// 会话令牌只存内存；来自其它网站的请求无法读取它。
+const nativeFetch = window.fetch.bind(window);
+let sessionToken;
+window.fetch = async (input, init = {}) => {
+  const target = new URL(typeof input === 'string' ? input : input.url, location.href);
+  const method = (init.method || 'GET').toUpperCase();
+  if (target.origin === location.origin && !['GET', 'HEAD'].includes(method)) {
+    if (!sessionToken) {
+      const response = await nativeFetch('/api/session', { cache: 'no-store' });
+      if (!response.ok) throw new Error('无法取得本地会话令牌，请刷新控制台');
+      sessionToken = (await response.json()).token;
+    }
+    const headers = new Headers(init.headers);
+    headers.set('X-Zaoba-Token', sessionToken);
+    headers.set('Content-Type', 'application/json');
+    init = { ...init, headers };
+  }
+  return nativeFetch(input, init);
+};
+
 const STATUS = {
   success: { label: '已签到', cls: 'ok' },
   already: { label: '今日已签', cls: 'ok' },

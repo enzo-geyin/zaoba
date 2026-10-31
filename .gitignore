@@ -11,6 +11,7 @@ data/probe/
 data/reports/
 data/results.jsonl
 data/.run.lock/
+data/.task.lock
 data/*.log
 
 # 本机配置（个人路径/开关），仓库里放 config.example.json 作为模板

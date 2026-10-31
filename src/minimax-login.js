@@ -7,6 +7,8 @@
  */
 import { launchContext } from './browser.js';
 import { loadConfig } from './config.js';
+import { acquireTaskLock } from './task-lock.js';
+acquireTaskLock();
 import { pageText } from './dom.js';
 import { createLogger } from './logger.js';
 

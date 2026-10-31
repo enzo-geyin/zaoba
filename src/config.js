@@ -58,7 +58,7 @@ const CLIENT_PLATFORM_DEFAULTS = {
     appCandidates: platform.knownAppPaths.trae,
     port: 9223, // 9222 常被其它 Chromium 应用占用，默认换 9223
     cdpMode: 'arg',
-    autoRestart: true,
+    autoRestart: false,
     quitAppName: 'Trae CN',
     // 签到入口在"账户菜单"里，必须先点开账户按钮
     pageUrlMatch: 'vscode-app', // 主界面是 workbench，另有悬浮按钮等页面
@@ -96,7 +96,7 @@ const CLIENT_PLATFORM_DEFAULTS = {
     openUrl: 'https://www.doubao.com/pc/agent-explore',
     keywords: ['立即签到'],
     doneKeywords: ['已领取', '今日已签到', '明天再来'],
-    autoRestart: true,
+    autoRestart: false,
     quitAppName: 'DoubaoWork',
     keepRunning: true,
     notes: '每日签到 +200 额度（在「免费用豆包」面板里）；脚本会自动打开该面板并点「立即签到」',
@@ -126,6 +126,7 @@ export function defaultConfig() {
     screenshotKeepDays: 7,
     schedule: { time: '08:00', retryTime: '12:30', randomDelayMinutes: 5 },
     notify: { macos: true, sound: true, webhookUrl: '' },
+    security: { allowJsEval: false },
     platforms: { ...CLIENT_PLATFORM_DEFAULTS, ...platforms },
   };
 }
@@ -133,6 +134,8 @@ export function defaultConfig() {
 export function loadConfig({ createIfMissing = true } = {}) {
   const def = defaultConfig();
   const exists = fs.existsSync(CONFIG_FILE);
+  const existing = readJSON(CONFIG_FILE, {});
+  if (!existing || typeof existing !== 'object' || Array.isArray(existing)) throw new Error('config.json 必须是 JSON 对象');
   if (!exists && createIfMissing) {
     writeJSON(CONFIG_FILE, def);
     console.log(`已生成默认配置: ${CONFIG_FILE}`);

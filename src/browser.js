@@ -25,7 +25,6 @@ export async function launchContext(cfg, { headless, logger } = {}) {
       '--disable-blink-features=AutomationControlled',
       '--no-first-run',
       '--no-default-browser-check',
-      '--disable-features=IsolateOrigins,site-per-process',
     ],
     ignoreDefaultArgs: ['--enable-automation'],
   };
