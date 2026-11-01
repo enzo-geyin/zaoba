@@ -141,9 +141,39 @@ test('macOS bootstrap失败恢复原定义，不触发kickstart领取', async ()
     calls.push(args[0]);
     if (args[0] === 'bootstrap' && ++bootstraps === 1) throw new Error('mock refused');
     return { stdout: '' };
-  } }), /未验证成功/);
+  }   }), /未确认生效/);
   assert.equal(fs.readFileSync(file, 'utf8'), '<old-definition />');
   assert.equal(calls.includes('kickstart'), false);
+});
+
+test('launchd 暂时拒绝注册时按系统回读结果静置重试', async () => {
+  const file = path.join(scratch, 'retry-task.plist');
+  let bootstraps = 0;
+  const waits = [];
+  const res = await installScheduler({
+    osName: 'darwin',
+    plistFile: file,
+    projectDir: scratch,
+    scriptPath: '/mock',
+    times: ['08:00'],
+    waitFn: async (ms) => { waits.push(ms); },
+    execFn: async (cmd, args) => {
+      if (args[0] === 'bootstrap') {
+        bootstraps += 1;
+        if (bootstraps === 1) {
+          const e = new Error('mock eio');
+          e.stderr = 'Bootstrap failed: 5: Input/output error';
+          throw e;
+        }
+        return { stdout: '' };
+      }
+      if (args[0] === 'print') return { stdout: 'descriptor = {\n\t\t"Minute" => 0\n\t\t"Hour" => 8\n\t}' };
+      return { stdout: '' };
+    },
+  });
+  assert.equal(res.method, 'launchd');
+  assert.equal(bootstraps, 2);
+  assert.deepEqual(waits, [800, 5000]);
 });
 
 test('调度验证失败恢复原配置，不覆盖并发变更', async () => {

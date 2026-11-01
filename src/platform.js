@@ -296,8 +296,49 @@ export function schedulerPath(base = 'com.local.ai-daily-checkin') {
   return path.join(os.homedir(), 'Library', 'LaunchAgents', `${base}.plist`);
 }
 
+/** 只有 launchctl 的"暂时拒绝"（EIO）才值得等待重试；参数或权限错误要立即失败。 */
+function isTransientBootstrapError(error) {
+  return /input\/output|EIO|error 5/i.test(`${error?.stderr || ''} ${error?.message || ''}`);
+}
+
+/**
+ * 注册单个 launchd 任务，返回是否成功（不抛异常）。
+ * 注意：标签已被注册时 launchctl 会以 EIO 失败，所以调用前必须先 bootout。
+ */
+async function bootstrapLaunchd({ execFn, domain, plist }) {
+  try {
+    await execFn('launchctl', ['bootstrap', domain, plist], { timeout: 8000 });
+    return true;
+  } catch (e) {
+    if (!isTransientBootstrapError(e)) throw e;
+    return false;
+  }
+}
+
+/**
+ * 卸载并重新注册，直到 launchd 的真实状态与请求一致。
+ * bootout 是异步的，紧跟着 bootstrap 常以 EIO 失败，因此每次重试前都静置更久。
+ */
+async function reinstallLaunchd({ execFn, label, uid, plist, expected, waitFn }) {
+  const settle = [800, 5000, 15000];
+  let effective = [];
+  let lastError = null;
+  for (let i = 0; i < settle.length; i += 1) {
+    await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
+    await waitFn(settle[i]);
+    try {
+      if (await bootstrapLaunchd({ execFn, domain: `gui/${uid}`, plist })) {
+        effective = await schedulerEffective({ label, osName: 'darwin', execFn });
+        if (effective.join(',') === expected.join(',')) return effective;
+      }
+    } catch (e) { lastError = e; }
+  }
+  if (lastError) throw lastError;
+  throw new Error(`launchd 已写入 ${plist}，但系统回读为 [${effective.join(',') || '空'}]，与请求 [${expected.join(',')}] 不一致。请手动执行：launchctl bootstrap gui/${uid} ${plist}`);
+}
+
 /** 安装定时任务：times 为 ['08:00','12:30'] */
-export async function installScheduler({ label = 'com.local.ai-daily-checkin', projectDir, scriptPath, times, logger, osName = process.platform, execFn = exec, plistFile, uid = process.getuid?.() ?? 0 }) {
+export async function installScheduler({ label = 'com.local.ai-daily-checkin', projectDir, scriptPath, times, logger, osName = process.platform, execFn = exec, plistFile, uid = process.getuid?.() ?? 0, waitFn = sleep }) {
   const valid = [...new Set(times.filter(Boolean))];
   if (!valid.length || valid.length > 3 || valid.some((t) => !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t))) throw new Error('需要 1~3 个有效的 HH:MM 时间点');
 
@@ -309,23 +350,20 @@ export async function installScheduler({ label = 'com.local.ai-daily-checkin', p
     fs.mkdirSync(path.join(projectDir, 'data/log'), { recursive: true });
     try {
       fs.writeFileSync(plist, next, 'utf8');
-      await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
-      await execFn('launchctl', ['bootstrap', `gui/${uid}`, plist], { timeout: 8000 });
-      const effective = await schedulerEffective({ label, osName, execFn });
-      if (effective.join(',') !== [...valid].sort().join(',')) throw new Error('launchd 运行中时间与请求不一致');
+      await reinstallLaunchd({ execFn, label, uid, plist, expected: [...valid].sort(), waitFn });
     } catch (error) {
       // 仅恢复本次替换的定义，不通过 kickstart 立即运行签到。
-      let recovery = '原来没有定时任务';
+      let recovery = `已写入 ${plist}，下次登录会自动加载，或手动执行：launchctl bootstrap gui/${uid} ${plist}`;
       try {
         if (!fs.existsSync(plist) || fs.readFileSync(plist, 'utf8') !== next) throw new Error('任务定义已被并发修改，未覆盖');
-        await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
         if (previous) {
+          await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
           fs.writeFileSync(plist, previous);
-          await execFn('launchctl', ['bootstrap', `gui/${uid}`, plist], { timeout: 8000 });
-          recovery = '已重新加载原任务定义';
-        } else if (fs.existsSync(plist)) fs.unlinkSync(plist);
+          await bootstrapLaunchd({ execFn, domain: `gui/${uid}`, plist });
+          recovery = '已恢复原任务定义';
+        }
       } catch (e) { recovery = `恢复失败：${e.message}`; }
-      throw new Error(`launchd 更新未验证成功：${error.message}；${recovery}`);
+      throw new Error(`定时设置未确认生效：${error.message}；${recovery}`);
     }
     return { method: 'launchd', plist, times: valid };
   }
