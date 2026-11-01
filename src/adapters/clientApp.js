@@ -222,8 +222,9 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
 
     // 4) 幂等：先看是不是今天已经签过
     let text = await pageText(page);
-    const doneHit = (pc.doneKeywords || []).find((k) => text.includes(k));
-    if (doneHit) return { status: 'already', detail: `页面显示「${doneHit}」，今天已完成` };
+    const stateText = pc.statusSelector ? await page.locator(pc.statusSelector).innerText().catch(() => '') : '';
+    const doneHit = classifyOutcome(stateText).already;
+    if (doneHit) return { status: 'already', detail: '签到状态容器显示明确的当日已完成状态' };
 
     // 4.5) 演练模式：只报告"能不能点到"，不执行任何调用
     if (dryRun) {
@@ -260,8 +261,8 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
 
       if (!r.ok) return { status: 'failed', detail: `jsEval 执行出错: ${r.error}` };
       const v = r.value || {};
-      if (v.status) return { status: v.status, detail: v.detail || '' };
-      return { status: 'success', detail: `jsEval 已执行，返回: ${JSON.stringify(v).slice(0, 200)}` };
+      if (typeof v.status === 'string' && v.status) return { status: v.status, detail: v.detail || '' };
+      return { status: 'uncertain', detail: 'jsEval 已执行，但没有返回明确业务状态，不能据此判定成功' };
     }
 
     // 5.5) 策略一·五：等特定元素出现（客户端刚启动时界面是逐步渲染的）
@@ -279,10 +280,11 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
           const loc = page.locator(sel).first();
           if (await loc.isVisible({ timeout: 1200 })) {
             logger?.step(`命中选择器 ${sel}，点击`);
+            const beforeClick = await pageText(page, 4000);
             await loc.click({ timeout: 5000 });
             await sleep(1500);
             const t3 = await pageText(page, 4000);
-            const o3 = classifyOutcome(t3);
+            const o3 = classifyOutcome(t3, { before: beforeClick });
             if (o3.already) return { status: 'already', detail: `点击 ${sel} 后提示已完成` };
             if (o3.success) return { status: 'success', detail: `点击 ${sel} 后出现成功提示` };
             if (o3.fail) return { status: 'failed', detail: `点击 ${sel} 后出现失败提示` };
@@ -299,6 +301,7 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
     const login = await detectLogin(page, text);
     if (login.needLogin) return { status: 'needs_login', detail: login.reason };
 
+    const beforeClick = await pageText(page, 5000);
     let res = await clickByKeywords(page, pc.keywords || ['签到', '领取'], logger, { label: pc.name || 'client' });
     if (!res.clicked) {
       logger?.step('首次未找到入口，等待 3 秒后重试（异步内容可能晚到）');
@@ -312,8 +315,8 @@ export async function runClientApp(pc, { logger, cfg, shotDir, shotName, dryRun 
     if (res.clicked) {
       await sleep(1800);
       const t2 = await pageText(page, 5000);
-      const o2 = classifyOutcome(t2);
-      const doneHit2 = (pc.doneKeywords || []).find((k) => t2.includes(k));
+      const o2 = classifyOutcome(t2, { before: beforeClick });
+      const doneHit2 = !o2.fail && (pc.doneKeywords || []).find((k) => t2.includes(k) && !beforeClick.includes(k));
       const stillThere = (await findClickables(page, pc.keywords || ['签到'])).length > 0;
 
       // 最可信的判定：点完之后入口按钮消失了，且页面出现"已领取/已签到"类文案

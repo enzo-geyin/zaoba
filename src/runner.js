@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { genericCheckin } from './adapters/index.js';
 import { gotoSettled, pageText, detectLogin, dismissOverlays, findClickables, screenshot, dumpHTML, classifyOutcome } from './dom.js';
 import { jitter, sleep, pruneOldDirs, today, nowISO } from './util.js';
-import { TimeoutError, withDeadline } from './runtime.js';
+import { TimeoutError, withDeadline, guardPage } from './runtime.js';
+import { retainTaskLock } from './task-lock.js';
 import { resolveAdapters } from './config.js';
 import {
   writeReport,
@@ -19,6 +21,23 @@ const SHOT_ROOT = path.resolve('data/shots');
 const RESULT_FILE = path.resolve('data/results.jsonl');
 const REPORT_DIR = path.resolve('data/reports');
 
+/** 未提供明确账号/活动标签时不相信本地完成缓存，交由适配器只读查验。 */
+export function completionScope(cfg, id) {
+  const pc = cfg.platforms?.[id] || {};
+  if (typeof pc.accountTag !== 'string' || !pc.accountTag.trim() || typeof pc.activityTag !== 'string' || !pc.activityTag.trim()) return null;
+  return createHash('sha256').update(JSON.stringify([id, pc.accountTag, pc.activityTag, pc.businessDayHour ?? 0, cfg.timezone || 'Asia/Shanghai'])).digest('hex');
+}
+
+export function businessDate(cfg, id, date = new Date()) {
+  const hour = cfg.platforms?.[id]?.businessDayHour ?? (id === 'qoder-cn' ? 10 : 0);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error('businessDayHour 必须为 0~23 的整数');
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone || 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const day = new Date(`${values.year}-${values.month}-${values.day}T12:00:00Z`);
+  if (Number(values.hour) < hour) day.setUTCDate(day.getUTCDate() - 1);
+  return day.toISOString().slice(0, 10);
+}
+
 /**
  * 今天是否已经全部签完。
  *
@@ -28,10 +47,10 @@ const REPORT_DIR = path.resolve('data/reports');
  */
 export function alreadyDoneToday(cfg, { only = [] } = {}) {
   const list = resolveAdapters(cfg, { only });
-  const date = today();
   const done = new Map();
   for (const r of readResultsJSONL(RESULT_FILE)) {
-    if (r.date !== date || r.dryRun || !list.some((a) => a.id === r.id)) continue;
+    const scope = completionScope(cfg, r.id);
+    if (!scope || r.scope !== scope || r.date !== businessDate(cfg, r.id) || r.dryRun || !list.some((a) => a.id === r.id)) continue;
     if (r.status === 'success' || r.status === 'already') done.set(r.id, r);
   }
   const pending = list.filter((a) => !done.has(a.id));
@@ -85,7 +104,7 @@ async function dryRunOne(adapter, page, logger, cfg) {
 async function runOne(ctx, adapter, logger, cfg, opts) {
   const started = Date.now();
   const shotDir = path.join(SHOT_ROOT, today());
-  const date = today();
+  const date = businessDate(cfg, adapter.id);
   let page;
   let result;
 
@@ -99,30 +118,33 @@ async function runOne(ctx, adapter, logger, cfg, opts) {
       result = await withDeadline(
         (signal, onAbort) => adapter.custom({ page: null, ctx: null, logger, cfg, shotDir, shotName: adapter.id,
           dryRun: !!opts.dryRun, allowRestart: !!opts.allowRestart, signal, onAbort }),
-        timeout, adapter.name,
+        timeout, adapter.name, { cleanupGraceMs: cfg.cleanupGraceMs ?? 5000 },
       );
     } else {
-      page = await ctx.newPage();
-      // 自定义网页适配器（复用 runner 的浏览器上下文，避免抢同一个 profile）
+      // 页面创建也纳入期限；创建太晚返回时立刻清理，不继续访问网站。
       const timeout = adapter.timeout || cfg.platformTimeout || 120000;
-      result = await withDeadline((signal, onAbort) => {
-        onAbort(() => page.close().catch(() => null));
+      result = await withDeadline(async (signal, onAbort) => {
+        page = await ctx.newPage();
+        onAbort(() => page.close());
+        signal.throwIfAborted();
+        const guarded = guardPage(page, signal);
         // 网页演练不调用领取型 custom；页面本身可能有自动登录积分等副作用。
-        if (opts.dryRun) return dryRunOne(adapter, page, logger, cfg);
+        if (opts.dryRun) return dryRunOne(adapter, guarded, logger, cfg);
         return typeof adapter.custom === 'function'
-          ? adapter.custom({ page, ctx, logger, cfg, shotDir, shotName: adapter.id, dryRun: false, signal, onAbort })
-          : genericCheckin(adapter, page, ctx, logger, cfg);
-      }, timeout, adapter.name);
+          ? adapter.custom({ page: guarded, ctx: guardPage(ctx, signal), logger, cfg, shotDir, shotName: adapter.id, dryRun: false, signal, onAbort })
+          : genericCheckin(adapter, guarded, guardPage(ctx, signal), logger, cfg);
+      }, timeout, adapter.name, { cleanupGraceMs: cfg.cleanupGraceMs ?? 5000 });
     }
   } catch (e) {
     const msg = String(e.message || e).split('\n')[0];
-    result = { status: e instanceof TimeoutError ? 'timeout' : 'error', detail: msg };
+    result = { status: e instanceof TimeoutError ? 'timeout' : 'error', detail: msg, fatal: e.fatal === true };
+    if (result.fatal) retainTaskLock();
     logger.error(`${adapter.name} 异常: ${msg}`);
   }
 
   // 无论成败都留一张截图：这是排障的唯一一手现场
   let shot = null;
-  if (page && !page.isClosed()) {
+  if (!result.fatal && page && !page.isClosed()) {
     shot = await screenshot(page, shotDir, adapter.id);
     if (['not_found', 'error', 'timeout', 'uncertain'].includes(result.status)) {
       await dumpHTML(page, shotDir, adapter.id).catch(() => null);
@@ -134,6 +156,7 @@ async function runOne(ctx, adapter, logger, cfg, opts) {
     ts: nowISO(),
     date,
     id: adapter.id,
+    scope: completionScope(cfg, adapter.id),
     name: adapter.name,
     status: result.status,
     detail: result.detail || '',
@@ -144,6 +167,7 @@ async function runOne(ctx, adapter, logger, cfg, opts) {
     shot: shot ? path.relative(process.cwd(), shot) : null,
     durationMs: Date.now() - started,
     dryRun: !!opts.dryRun,
+    fatal: result.fatal || undefined,
   };
   appendResultJSONL(RESULT_FILE, record);
   return record;
@@ -174,17 +198,29 @@ export async function runAll(ctx, cfg, opts = {}) {
     results.push(await runOne(ctx, adapter, logger, cfg, { dryRun, allowRestart: opts.allowRestart }));
     const r = results[results.length - 1];
     logger.info(`${statusIcon(r.status)} ${adapter.name}: ${r.status} ${r.detail ? '· ' + r.detail : ''}`);
+    if (r.fatal) {
+      logger.error('无法确认超时任务已安全退出，停止本轮剩余平台并保留任务锁；请人工确认');
+      for (const remaining of list.slice(i + 1)) {
+        const skipped = { ts: nowISO(), date: businessDate(cfg, remaining.id), id: remaining.id, name: remaining.name,
+          scope: completionScope(cfg, remaining.id), status: 'skipped', detail: '前一平台超时清理未确认，本轮安全停止，未执行', dryRun };
+        appendResultJSONL(RESULT_FILE, skipped);
+        results.push(skipped);
+      }
+      break;
+    }
     if (i < list.length - 1) {
       // 平台之间留 3~9 秒随机间隔
       await jitter(3000, 9000);
     }
   }
 
-  pruneOldDirs(SHOT_ROOT, cfg.screenshotKeepDays || 7);
+  if (!results.some((r) => r.fatal)) pruneOldDirs(SHOT_ROOT, cfg.screenshotKeepDays || 7);
 
   const date = today();
   const reportFile = writeReport(REPORT_DIR, date, results, { time: nowISO(), dryRun });
   logger.info(`日报: ${reportFile}`);
+
+  if (results.some((r) => r.fatal)) return results;
 
   if (!dryRun && cfg.notify?.macos) {
     const ok = results.filter((r) => r.status === 'success' || r.status === 'already').length;

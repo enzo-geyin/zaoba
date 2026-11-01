@@ -162,6 +162,7 @@ async function runMinimax({ page, logger, cfg, shotDir, shotName, dryRun }) {
     }
 
     // 点签到按钮（按钮文案形如「签到得 400」）
+    const beforeClaim = text;
     let claimed = false;
     try {
       const btn = page.getByRole('button', { name: CLAIM_BUTTON_PATTERN }).first();
@@ -181,8 +182,9 @@ async function runMinimax({ page, logger, cfg, shotDir, shotName, dryRun }) {
     text = await pageText(page);
     await screenshot(page, shotDir, shotName).catch(() => null);
 
-    const success = SUCCESS_TEXTS.find((k) => text.includes(k));
-    const doneAfter = DONE_TEXTS.find((k) => text.includes(k));
+    const failed = /签到失败|领取失败|网络异常|系统繁忙/.test(text);
+    const success = !failed && SUCCESS_TEXTS.find((k) => text.includes(k) && !beforeClaim.includes(k));
+    const doneAfter = !failed && DONE_TEXTS.find((k) => text.includes(k) && !beforeClaim.includes(k));
     const points = (() => {
       const m = text.match(/\+(\d{2,5})\s*积分/);
       return m ? Number(m[1]) : null;

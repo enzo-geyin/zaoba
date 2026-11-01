@@ -204,6 +204,7 @@ export async function notify(title, message, { sound = true } = {}) {
  * ------------------------------------------------------------------ */
 
 function macPlistXml({ label, projectDir, scriptPath, times }) {
+  const esc = (x) => String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const blocks = times
     .map((t) => {
       const [h, m] = t.split(':').map(Number);
@@ -218,11 +219,11 @@ function macPlistXml({ label, projectDir, scriptPath, times }) {
   <string>${label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${process.execPath}</string>
-    <string>${scriptPath}</string>
+    <string>${esc(process.execPath)}</string>
+    <string>${esc(scriptPath)}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${projectDir}</string>
+  <string>${esc(projectDir)}</string>
   <key>StartCalendarInterval</key>
   <array>
 ${blocks}
@@ -234,19 +235,19 @@ ${blocks}
     <key>PATH</key>
     <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
-    <string>${os.homedir()}</string>
+    <string>${esc(os.homedir())}</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>${projectDir}/data/log/launchd.out.log</string>
+  <string>${esc(projectDir)}/data/log/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>${projectDir}/data/log/launchd.err.log</string>
+  <string>${esc(projectDir)}/data/log/launchd.err.log</string>
 </dict>
 </plist>
 `;
 }
 
 /** Windows 计划任务 XML：错过（睡眠）后补跑 + 唤醒计算机执行 */
-export function buildWindowsTaskXml({ time, nodeBin, scriptPath }) {
+export function buildWindowsTaskXml({ time, nodeBin, scriptPath, projectDir = path.dirname(path.dirname(scriptPath)) }) {
   const [h, m] = String(time).split(':').map(Number);
   const pad = (n) => String(n).padStart(2, '0');
   const start = `2026-01-01T${pad(h)}:${pad(m)}:00`;
@@ -279,6 +280,7 @@ export function buildWindowsTaskXml({ time, nodeBin, scriptPath }) {
     <Exec>
       <Command>${esc(nodeBin)}</Command>
       <Arguments>"${esc(scriptPath)}"</Arguments>
+      <WorkingDirectory>${esc(projectDir)}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -295,50 +297,102 @@ export function schedulerPath(base = 'com.local.ai-daily-checkin') {
 }
 
 /** 安装定时任务：times 为 ['08:00','12:30'] */
-export async function installScheduler({ label = 'com.local.ai-daily-checkin', projectDir, scriptPath, times, logger }) {
-  const valid = times.filter(Boolean);
-  if (!valid.length) throw new Error('没有有效的时间点');
+export async function installScheduler({ label = 'com.local.ai-daily-checkin', projectDir, scriptPath, times, logger, osName = process.platform, execFn = exec, plistFile, uid = process.getuid?.() ?? 0 }) {
+  const valid = [...new Set(times.filter(Boolean))];
+  if (!valid.length || valid.length > 3 || valid.some((t) => !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t))) throw new Error('需要 1~3 个有效的 HH:MM 时间点');
 
-  if (isMacOS) {
-    const plist = schedulerPath(label);
+  if (osName === 'darwin') {
+    const plist = plistFile || schedulerPath(label);
     fs.mkdirSync(path.dirname(plist), { recursive: true });
-    fs.writeFileSync(plist, macPlistXml({ label, projectDir, scriptPath, times: valid }), 'utf8');
-    const uid = process.getuid();
-    await exec('launchctl', ['bootout', `gui/${uid}/${label}`]).catch(() => null);
-    await sleep(800);
+    const previous = fs.existsSync(plist) ? fs.readFileSync(plist) : null;
+    const next = macPlistXml({ label, projectDir, scriptPath, times: valid });
+    fs.mkdirSync(path.join(projectDir, 'data/log'), { recursive: true });
     try {
-      await exec('launchctl', ['bootstrap', `gui/${uid}`, plist]);
-    } catch {
-      await sleep(1500);
-      await exec('launchctl', ['bootstrap', `gui/${uid}`, plist]).catch(async () => {
-        await exec('launchctl', ['kickstart', '-k', `gui/${uid}/${label}`]).catch(() => null);
-      });
+      fs.writeFileSync(plist, next, 'utf8');
+      await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
+      await execFn('launchctl', ['bootstrap', `gui/${uid}`, plist], { timeout: 8000 });
+      const effective = await schedulerEffective({ label, osName, execFn });
+      if (effective.join(',') !== [...valid].sort().join(',')) throw new Error('launchd 运行中时间与请求不一致');
+    } catch (error) {
+      // 仅恢复本次替换的定义，不通过 kickstart 立即运行签到。
+      let recovery = '原来没有定时任务';
+      try {
+        if (!fs.existsSync(plist) || fs.readFileSync(plist, 'utf8') !== next) throw new Error('任务定义已被并发修改，未覆盖');
+        await execFn('launchctl', ['bootout', `gui/${uid}/${label}`], { timeout: 8000 }).catch(() => null);
+        if (previous) {
+          fs.writeFileSync(plist, previous);
+          await execFn('launchctl', ['bootstrap', `gui/${uid}`, plist], { timeout: 8000 });
+          recovery = '已重新加载原任务定义';
+        } else if (fs.existsSync(plist)) fs.unlinkSync(plist);
+      } catch (e) { recovery = `恢复失败：${e.message}`; }
+      throw new Error(`launchd 更新未验证成功：${error.message}；${recovery}`);
     }
     return { method: 'launchd', plist, times: valid };
   }
 
-  if (isWindows) {
+  if (osName === 'win32') {
+    const names = ['ZaobaDailyCheckin', 'ZaobaDailyCheckin2', 'ZaobaDailyCheckin3'];
+    const originals = new Map();
+    const changes = new Map();
+    const query = async (name) => {
+      try { return (await execFn('schtasks', ['/Query', '/TN', name, '/XML'], { timeout: 15000 })).stdout; }
+      catch (e) {
+        if (/cannot find|does not exist|找不到|不存在/i.test(`${e.stderr || ''} ${e.message}`)) return null;
+        throw e;
+      }
+    };
+    for (const name of names) originals.set(name, await query(name));
     const created = [];
+    try {
     for (const [i, t] of valid.entries()) {
       const taskName = i === 0 ? 'ZaobaDailyCheckin' : `ZaobaDailyCheckin${i + 1}`;
-      const xmlPath = path.join(os.tmpdir(), `zaoba-task-${i}.xml`);
-      const xmlText = buildWindowsTaskXml({ time: t, nodeBin: process.execPath, scriptPath });
-      fs.writeFileSync(xmlPath, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xmlText, 'utf16le')]));
-      await exec('schtasks', ['/Delete', '/TN', taskName, '/F'], { timeout: 15000 }).catch(() => null);
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zaoba-task-'));
+      const xmlPath = path.join(tempDir, 'task.xml');
+      const xmlText = buildWindowsTaskXml({ time: t, nodeBin: process.execPath, scriptPath, projectDir });
       try {
-        // 用 XML 注册，才能带上 WakeToRun / StartWhenAvailable
-        await exec('schtasks', ['/Create', '/TN', taskName, '/XML', xmlPath, '/F'], { timeout: 25000 });
-      } catch (e) {
-        // 回退：至少保证任务能跑
-        logger?.warn(`XML 注册失败，回退到简单模式: ${String(e.message).split('\n')[0]}`);
-        await exec(
-          'schtasks',
-          ['/Create', '/F', '/SC', 'DAILY', '/ST', t, '/TN', taskName, '/TR', `"${process.execPath}" "${scriptPath}"`],
-          { timeout: 20000 },
-        );
+        fs.writeFileSync(xmlPath, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xmlText, 'utf16le')]));
+        // 不先删旧任务；注册失败时保留原任务，不静默降级为缺少唤醒/工作目录的版本。
+        await execFn('schtasks', ['/Create', '/TN', taskName, '/XML', xmlPath, '/F'], { timeout: 25000 });
+        const stdout = await query(taskName);
+        changes.set(taskName, stdout);
+        const esc = (x) => String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        if (!stdout?.includes(`<StartBoundary>2026-01-01T${t}:00</StartBoundary>`) || !stdout.includes(`<WorkingDirectory>${esc(projectDir)}</WorkingDirectory>`) || !stdout.includes(`<Command>${esc(process.execPath)}</Command>`)) {
+          throw new Error(`计划任务 ${taskName} 回读不匹配；可能已部分更新，请检查系统任务`);
+        }
+      } finally {
+        if (fs.existsSync(xmlPath)) fs.unlinkSync(xmlPath);
+        fs.rmdirSync(tempDir);
       }
-      fs.rmSync(xmlPath, { force: true });
       created.push(taskName);
+    }
+    // 关闭补跑必须删除旧的额外任务，而不仅是不再创建它。
+    for (const taskName of names.slice(valid.length)) {
+      if (await query(taskName) === null) continue;
+      await execFn('schtasks', ['/Delete', '/TN', taskName, '/F'], { timeout: 15000 });
+      changes.set(taskName, null);
+      if (await query(taskName) !== null) throw new Error(`旧补跑任务 ${taskName} 未移除`);
+    }
+    } catch (error) {
+      const recovery = [];
+      for (const [name, written] of [...changes].reverse()) {
+        try {
+          if (await query(name) !== written) { recovery.push(`${name} 已有并发改动，未覆盖`); continue; }
+          const previous = originals.get(name);
+          if (previous === null) {
+            if (written !== null) await execFn('schtasks', ['/Delete', '/TN', name, '/F'], { timeout: 15000 });
+          } else {
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zaoba-restore-'));
+            const file = path.join(dir, 'task.xml');
+            try {
+              fs.writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(previous.replace(/^\uFEFF/, ''), 'utf16le')]));
+              await execFn('schtasks', ['/Create', '/TN', name, '/XML', file, '/F'], { timeout: 25000 });
+            } finally { if (fs.existsSync(file)) fs.unlinkSync(file); fs.rmdirSync(dir); }
+          }
+          if (await query(name) !== previous) throw new Error('恢复回读不匹配');
+          recovery.push(`${name} 已恢复`);
+        } catch (e) { recovery.push(`${name} 恢复未确认：${e.message}`); }
+      }
+      throw new Error(`Windows 定时更新失败：${error.message}；${recovery.join('；') || '未确认任何成功写入，请检查系统任务'}`);
     }
     logger?.info(`已创建 Windows 计划任务: ${created.join(', ')}（含"错过则唤醒补跑"）`);
     return { method: 'schtasks', tasks: created, times: valid };
@@ -365,32 +419,38 @@ export async function removeScheduler({ label = 'com.local.ai-daily-checkin', lo
   return false;
 }
 
-/** 读取实际生效的时间（用于校验），返回 ['08:00','12:30'] */
-export async function schedulerEffective({ label = 'com.local.ai-daily-checkin' } = {}) {
-  if (isMacOS) {
-    const plist = schedulerPath(label);
-    if (!fs.existsSync(plist)) return [];
+/** 解析 launchctl print 的运行中日历触发器；未知格式宁可未确认，不回退到磁盘 plist。 */
+export function parseLaunchdTimes(output) {
+  const times = [];
+  for (const match of String(output).matchAll(/descriptor\s*=\s*\{([^{}]*)\}/g)) {
+    const h = match[1].match(/"?Hour"?\s*(?:=>|=)\s*(\d+)/);
+    const m = match[1].match(/"?Minute"?\s*(?:=>|=)\s*(\d+)/);
+    if (h && m && Number(h[1]) < 24 && Number(m[1]) < 60) times.push(`${h[1].padStart(2, '0')}:${m[1].padStart(2, '0')}`);
+  }
+  return times.sort();
+}
+
+/** 只读运行中系统任务，不把已保存的文件当成生效证据。 */
+export async function schedulerEffective({ label = 'com.local.ai-daily-checkin', osName = process.platform, execFn = exec } = {}) {
+  if (osName === 'darwin') {
     try {
-      const { stdout } = await exec('plutil', ['-convert', 'json', '-o', '-', plist]);
-      const data = JSON.parse(stdout);
-      const list = Array.isArray(data.StartCalendarInterval) ? data.StartCalendarInterval : [data.StartCalendarInterval];
-      return list
-        .filter(Boolean)
-        .map((x) => `${String(x.Hour).padStart(2, '0')}:${String(x.Minute).padStart(2, '0')}`);
-    } catch {
-      return [];
+      const { stdout } = await execFn('launchctl', ['print', `gui/${process.getuid?.() ?? 0}/${label}`], { timeout: 8000 });
+      return parseLaunchdTimes(stdout);
+    } catch (e) {
+      if (/could not find service|找不到|不存在/i.test(`${e.stderr || ''} ${e.message}`)) return [];
+      throw new Error(`无法读取 launchd 实际状态：${e.message}`);
     }
   }
 
-  if (isWindows) {
+  if (osName === 'win32') {
     const out = [];
     for (const name of ['ZaobaDailyCheckin', 'ZaobaDailyCheckin2', 'ZaobaDailyCheckin3']) {
       try {
-        const { stdout } = await exec('schtasks', ['/Query', '/TN', name, '/XML'], { timeout: 15000 });
+        const { stdout } = await execFn('schtasks', ['/Query', '/TN', name, '/XML'], { timeout: 15000 });
         const m = stdout.match(/<StartBoundary>(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/);
-        if (m) out.push(m[1].slice(11, 16));
-      } catch {
-        /* 该任务不存在 */
+        if (m && !/<Enabled>\s*false\s*<\/Enabled>/i.test(stdout)) out.push(m[1].slice(11, 16));
+      } catch (e) {
+        if (!/cannot find|does not exist|找不到|不存在/i.test(`${e.stderr || ''} ${e.message}`)) throw e;
       }
     }
     return out;

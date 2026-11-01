@@ -11,6 +11,11 @@
 - `jsEval` 默认禁用；只有核验可信后，才可显式设置 `security.allowJsEval: true`。
 - Node.js 要求统一为 20+，Playwright 锁定 1.64.1。运行 `npm test` 执行无真实账号的回归测试；CI 覆盖 macOS / Windows / Linux。
 - 超时会阻止后续动作、关闭脚本页面/断开调试连接并等待清理；无法撤回服务端已经收到的领取请求。
+- 成功判定必须有已知业务码或本次新增的明确成功状态；HTTP 200、HTML、泛化奖励文案和历史成功不作为领取证据。通用 DOM 的点击前“已完成”只接受显式 `statusSelector` 指定的签到状态容器，不再凭全页文案直接跳过；未配置时可能保守地报告待确认。
+- 超时后清理宽限默认 5 秒（`cleanupGraceMs`）；无法确认退出即停止整轮，剩余平台记录为 `skipped`，保留任务锁并仅结束本次 CLI 工作进程。不强杀用户客户端，也不能撤回已发送的服务端请求。
+- 退出码：`0` 全部完成/无待办（演练为检查通过），`1` 无成功，`2` 部分完成，`3` 超时清理未确认。控制台区分演练与领取，刷新/SSE 重连恢复服务端任务快照。
+- 定时更新需系统任务回读匹配才报告生效；Windows 指定工作目录并移除关闭后的旧补跑。更新失败尝试恢复本次改动，不覆盖已检测到的并发变更，恢复未确认会明确报错；不再使用 `kickstart` 作为安装失败兜底触发领取。
+- 本地完成缓存仅在平台显式配置非空 `accountTag`、`activityTag` 时使用（只保存其哈希，不要填写 token/密码）。切换账号或活动必须同步更改标签；这不是自动身份识别。未设标签和旧记录将重新核验平台状态。业务日按 `timezone`（默认上海）计算，可设 `businessDayHour: 0..23`，Qoder 默认 10 点切日。
 - 以下上游说明保留供参考；发生冲突时以上述安全规则和当前源码为准。
 
 [![CI](https://github.com/BorisSun0424-boop/zaoba/actions/workflows/ci.yml/badge.svg)](https://github.com/BorisSun0424-boop/zaoba/actions/workflows/ci.yml)

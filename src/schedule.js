@@ -77,7 +77,7 @@ export function dailyScriptPath() {
  */
 export async function installSchedule({ logger } = {}) {
   const sched = getSchedule();
-  const times = [sched.time, sched.retryTime].filter(Boolean);
+  const times = [...new Set([sched.time, sched.retryTime].filter(Boolean))];
   const res = await platform.installScheduler({
     label: LABEL,
     projectDir: PROJECT_DIR,
@@ -99,10 +99,22 @@ export async function readEffectiveSchedule() {
 }
 
 /** 一站式：保存配置 + 安装定时任务 */
-export async function applySchedule(patch, { logger } = {}) {
-  if (patch) saveSchedule(patch);
-  const res = await installSchedule({ logger });
-  return { time: res.time, retryTime: res.retryTime, randomDelayMinutes: res.randomDelayMinutes, method: res.method };
+export async function applySchedule(patch, { logger, install = installSchedule, readEffective = readEffectiveSchedule } = {}) {
+  const previous = readRawConfig();
+  let written;
+  try {
+    if (patch) saveSchedule(patch);
+    written = fs.readFileSync(path.join(PROJECT_DIR, 'config.json'), 'utf8');
+    const res = await install({ logger });
+    const effective = await readEffective();
+    const expected = [...new Set([res.time, res.retryTime].filter(Boolean))].sort();
+    if (JSON.stringify([...effective].sort()) !== JSON.stringify(expected)) throw new Error('系统任务回读与请求不一致，未确认生效');
+    return { time: res.time, retryTime: res.retryTime, randomDelayMinutes: res.randomDelayMinutes, method: res.method };
+  } catch (e) {
+    // 不覆盖等待系统调用期间其它进程对配置的修改。
+    if (written && fs.readFileSync(path.join(PROJECT_DIR, 'config.json'), 'utf8') === written) writeJSON(path.join(PROJECT_DIR, 'config.json'), previous);
+    throw new Error(`定时设置未确认生效：${e.message}。请核对系统任务；未覆盖并发配置修改`, { cause: e });
+  }
 }
 
 export { PROJECT_DIR };

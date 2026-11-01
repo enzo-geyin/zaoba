@@ -11,8 +11,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { isWindows } from './platform.js';
+import { fileURLToPath } from 'node:url';
+import { readJSON } from './util.js';
 
-const PROJECT_DIR = process.cwd();
+const PROJECT_DIR = fileURLToPath(new URL('..', import.meta.url));
+process.chdir(PROJECT_DIR);
 const LOG_DIR = path.join(PROJECT_DIR, 'data', 'log');
 const LOG_FILE = path.join(LOG_DIR, 'launchd.log');
 const LOCK_DIR = path.join(PROJECT_DIR, 'data', '.run.lock');
@@ -35,36 +38,23 @@ function log(msg) {
 }
 
 function readConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(PROJECT_DIR, 'config.json'), 'utf8'));
-  } catch {
-    return {};
-  }
+  return readJSON(path.join(PROJECT_DIR, 'config.json'), {});
 }
 
 function acquireLock() {
-  const staleMs = 6 * 3600 * 1000;
+  fs.mkdirSync(path.dirname(LOCK_DIR), { recursive: true });
   try {
     fs.mkdirSync(LOCK_DIR, { recursive: false });
     return true;
-  } catch {
-    try {
-      const st = fs.statSync(LOCK_DIR);
-      if (Date.now() - st.mtimeMs > staleMs) {
-        fs.rmSync(LOCK_DIR, { recursive: true, force: true });
-        fs.mkdirSync(LOCK_DIR, { recursive: false });
-        return true;
-      }
-    } catch {
-      /* 忽略 */
-    }
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
     return false;
   }
 }
 
 function releaseLock() {
   try {
-    fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+    fs.rmdirSync(LOCK_DIR);
   } catch {
     /* ignore */
   }
@@ -74,8 +64,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   if (!acquireLock()) {
-    log('已有实例在运行，本次跳过');
-    return 0;
+    log(`已有日跑实例或遗留锁，本次停止；请确认原任务结束后处理 ${LOCK_DIR}`);
+    return 1;
   }
 
   try {

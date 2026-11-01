@@ -223,7 +223,7 @@ export default defineAdapter({
       // 回读确认（不轻信返回值）
       await sleep(2000);
       const after = pickStatus(await page.evaluate(() => window.wb.invoke('auth:getCheckinStatus')));
-      if (after.today_checked_in) {
+      if (after.active === true && after.today_checked_in === true) {
         Object.assign(meta, { streak: after.streak_days, credits: after.total_credits, todayCredit: after.today_credit });
         const gained = after.total_credits !== undefined && before.total_credits !== undefined ? after.total_credits - before.total_credits : null;
         return done(

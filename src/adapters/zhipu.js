@@ -94,8 +94,14 @@ export default defineAdapter({
       { headers, apiCheckin: API_CHECKIN, apiMember: API_MEMBER },
     );
 
-    const ck = res.checkin || {};
-    const body = ck.json || {};
+    return interpretZhipuResponse(res, logger);
+  },
+});
+
+/** 只接受已知业务码；HTTP 200、HTML、空对象都不是签到成功证据。 */
+export function interpretZhipuResponse(res, logger) {
+    const ck = res?.checkin || {};
+    const body = ck.json && typeof ck.json === 'object' && !Array.isArray(ck.json) ? ck.json : {};
     const code = String(body.status ?? body.code ?? '');
     logger.step(`签到接口 HTTP ${ck.http} code=${code || '-'} msg=${body.message || body.msg || ''}`);
 
@@ -105,13 +111,13 @@ export default defineAdapter({
     }
 
     // 今日已领（幂等，正常情况）
-    if (code === '10001') {
+    if (ck.http === 200 && code === '10001') {
       const pts = readPoints(res.member);
       return { status: 'already', detail: `今日登录积分已领取${pts !== null ? `，当前积分 ${pts}` : ''}`, meta: { credits: pts } };
     }
 
     // 成功
-    if (ck.http === 200 && (code === '10000' || code === '0' || code === '')) {
+    if (ck.http === 200 && (code === '10000' || code === '0')) {
       const pts = readPoints(res.member);
       const gained = body.result?.score ?? body.result?.left_score ?? null;
       const gainTxt = gained !== null && gained !== undefined ? `+${Number(gained) / (Number(gained) > 1000 ? 100 : 1)}` : '';
@@ -123,11 +129,10 @@ export default defineAdapter({
     }
 
     return {
-      status: 'failed',
-      detail: `签到接口返回 HTTP ${ck.http} ${body.message || body.msg || ck.text || ''}`.trim(),
+      status: ck.http === 200 ? 'uncertain' : 'failed',
+      detail: `无法确认签到：HTTP ${ck.http}，业务码 ${code || '缺失'}；${body.message || body.msg || ck.error || '响应不符合已知协议'}`,
     };
-  },
-});
+}
 
 /** member_info 的 left_score 是 1/100 精度 */
 function readPoints(member) {

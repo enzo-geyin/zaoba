@@ -19,7 +19,9 @@ window.fetch = async (input, init = {}) => {
     headers.set('Content-Type', 'application/json');
     init = { ...init, headers };
   }
-  return nativeFetch(input, init);
+  const response = await nativeFetch(input, init);
+  if (response.status === 403 && target.origin === location.origin) sessionToken = undefined;
+  return response;
 };
 
 const STATUS = {
@@ -32,6 +34,7 @@ const STATUS = {
   failed: { label: '签到失败', cls: 'bad' },
   error: { label: '运行出错', cls: 'bad' },
   timeout: { label: '超时', cls: 'bad' },
+  skipped: { label: '安全停止·未执行', cls: 'warn' },
   not_installed: { label: '未安装', cls: 'idle' },
   offline: { label: '离线跳过', cls: 'idle' },
   dry_run: { label: '演练通过', cls: 'idle' },
@@ -58,7 +61,10 @@ async function fetchState() {
   const r = await fetch('/api/state');
   if (!r.ok) throw new Error('读取状态失败');
   state = await r.json();
+  running = !!state.task?.busy;
   render();
+  updateRunUI(running);
+  if (state.task?.externalOrStale) $('#subline').textContent += ' · 存在外部任务或遗留锁，请先核对；不会自动清锁';
 }
 
 function nextRunText() {
@@ -105,8 +111,8 @@ function renderSummary() {
 
   box.append(
     stat('今日完成', `${done}/${total}`, '', total && done === total ? '全部完成 ✓' : total ? '还有平台待签' : '没有启用的平台'),
-    stat('连续签到', summary.streak ?? '—', summary.streak ? '天' : '', wb?.last?.meta?.activity || 'WorkBuddy'),
-    stat('累计 Credits', summary.credits ?? '—', '', summary.credits != null ? `今日 +${wb?.last?.meta?.todayCredit ?? '—'}` : '暂无数据'),
+    stat('连续签到', summary.streak ?? '—', summary.streak ? '天' : '', wb?.lastVerifiedMeta?.activity || 'WorkBuddy'),
+    stat('累计 Credits', summary.credits ?? '—', '', summary.credits != null ? `最近核验 ${wb?.lastVerifiedAt || '时间未知'}` : '暂无数据'),
     stat('下次自动', state.schedule.time, '', `随机延迟 ≤${state.schedule.randomDelayMinutes} 分`),
   );
 }
@@ -352,16 +358,24 @@ function connectEvents() {
     } catch {
       return;
     }
-    if (ev.type === 'log') {
+    if (ev.type === 'snapshot') {
+      running = !!ev.task?.busy;
+      updateRunUI(running);
+      fetchState().catch(() => {});
+    } else if (ev.type === 'log') {
       appendLog(ev.line, ev.level === 'error' ? 'error' : undefined);
     } else if (ev.type === 'run-start') {
       running = true;
       updateRunUI(true);
     } else if (ev.type === 'run-end') {
-      running = false;
-      updateRunUI(false);
-      appendLog(`──────── 运行结束（退出码 ${ev.code}）────────`, ev.code === 0 ? 'ok' : 'warn');
-      toast(ev.code === 0 ? '签到完成' : `运行结束，退出码 ${ev.code}`, ev.code !== 0);
+      running = !!ev.task?.busy;
+      updateRunUI(running);
+      const summary = ev.summary;
+      const detail = summary
+        ? `${summary.dryRun ? '演练' : '签到'}结束：${summary.completed}/${summary.total} ${summary.dryRun ? '检查通过' : '已确认完成'}${summary.pending ? `，${summary.pending} 项待处理` : ''}`
+        : `运行结束，退出码 ${ev.code}（不代表全部签到成功）`;
+      appendLog(`──────── ${detail} ────────`, ev.code === 0 ? 'ok' : 'warn');
+      toast(summary?.fatal ? '超时清理未确认，已停止整轮；请人工核对任务锁' : detail, ev.code !== 0);
       setTimeout(fetchState, 400);
     } else if (ev.type === 'state') {
       fetchState();
@@ -561,9 +575,10 @@ async function loadSchedule() {
     const data = await r.json();
     sched = data.config || sched;
     $('#schedLabel').textContent = sched.time;
-    $('#schedEffective').textContent = data.effective?.length ? `launchd 实际生效：${data.effective.join(' / ')}` : 'launchd 未安装';
-  } catch {
-    /* 忽略，保持默认显示 */
+    if (!r.ok) throw new Error(data.error || '无法读取系统定时状态');
+    $('#schedEffective').textContent = data.effective?.length ? `系统任务实际生效：${data.effective.join(' / ')}` : '未确认已生效的系统任务';
+  } catch (e) {
+    $('#schedEffective').textContent = `生效状态未知：${e.message}`;
   }
 }
 
@@ -591,7 +606,7 @@ async function saveSchedule() {
     if (!r.ok) throw new Error(data.error || '保存失败');
     sched = data.config;
     $('#schedLabel').textContent = sched.time;
-    $('#schedEffective').textContent = `launchd 实际生效：${(data.effective || []).join(' / ')}`;
+    $('#schedEffective').textContent = `系统任务实际生效：${(data.effective || []).join(' / ')}`;
     toast(`已改为每天 ${sched.time}${sched.retryTime ? `（补跑 ${sched.retryTime}）` : ''}`);
     $('#scheduleModal').classList.remove('show');
     fetchState().catch(() => {});

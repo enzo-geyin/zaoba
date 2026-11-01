@@ -11,9 +11,9 @@ import { probeCommand } from './probe.js';
 import { clientsCommand } from './clients.js';
 import { getSchedule, applySchedule, readEffectiveSchedule, installSchedule, removeSchedule } from './schedule.js';
 import { webCommand } from './server.js';
-import { statusIcon, readResultsJSONL } from './notify.js';
+import { statusIcon, readResultsJSONL, summarizeResults } from './notify.js';
 import { today } from './util.js';
-import { acquireTaskLock } from './task-lock.js';
+import { acquireTaskLock, isTaskLockRetained } from './task-lock.js';
 
 const HELP = `
 早八 zaoba · 每天 8:30 替你领额度（详见 README.md / RESEARCH.md）
@@ -239,7 +239,7 @@ async function main() {
     try {
       results = await runAll(ctx, cfg, { logger, only: pendingOnly, dryRun, skipIfDone: args.skipIfDone, allowRestart: args.allowRestart });
     } finally {
-      if (ctx) await ctx.close().catch(() => null);
+      if (ctx && !isTaskLockRetained()) await ctx.close().catch(() => null);
     }
 
     console.log('');
@@ -251,8 +251,11 @@ async function main() {
     if (results.some((r) => r.status === 'needs_login')) {
       console.log('有平台登录态失效，运行 npm run login 重新登录一次即可。\n');
     }
-    // 定时任务里只要不是"全部失败"就算正常退出，避免 launchd 反复报警
-    process.exitCode = ok > 0 || results.length === 0 ? 0 : 1;
+    const summary = summarizeResults(results, { dryRun });
+    process.exitCode = summary.code;
+    if (process.send) await new Promise((resolve) => process.send({ type: 'run-result', summary }, () => resolve()));
+    // 只结束本次 CLI 工作进程；不结束用户客户端，遗留锁保留给人工核对。
+    if (summary.fatal) process.exit(summary.code);
     return;
   }
 
@@ -263,5 +266,6 @@ async function main() {
 
 main().catch((e) => {
   console.error('未捕获异常:', e?.stack || e);
+  if (isTaskLockRetained()) process.exit(3);
   process.exitCode = 1;
 });

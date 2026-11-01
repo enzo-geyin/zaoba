@@ -46,6 +46,14 @@ export async function webhookNotify(url, payload) {
   }
 }
 
+/** 进程结束不等于全部成功；演练与真实领取使用不同的成功口径。 */
+export function summarizeResults(results, { dryRun = false } = {}) {
+  const completed = results.filter((r) => ['success', 'already', ...(dryRun ? ['dry_run'] : [])].includes(r.status)).length;
+  const fatal = results.some((r) => r.fatal);
+  return { total: results.length, completed, pending: results.length - completed, dryRun, fatal,
+    code: fatal ? 3 : completed === results.length ? 0 : completed > 0 ? 2 : 1 };
+}
+
 /** 一行摘要，用于通知：✅通义 ✅Kimi 🔑豆包 */
 export function oneLineSummary(results) {
   return results.map((r) => `${statusIcon(r.status)}${r.name}`).join(' ');

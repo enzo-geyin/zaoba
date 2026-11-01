@@ -11,6 +11,7 @@ import { readResultsJSONL } from './notify.js';
 import { scanApps } from './clients.js';
 import platform from './platform.js';
 import { getSchedule, applySchedule, readEffectiveSchedule } from './schedule.js';
+import { completionScope, businessDate } from './runner.js';
 
 const exec = promisify(execFile);
 
@@ -124,7 +125,8 @@ export function buildState({ cfg = loadConfig({ createIfMissing: false }), recor
   };
 
   const platforms = adapters.map((a) => {
-    const list = (byPlatform.get(a.id) || []).slice().sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
+    const scope = completionScope(cfg, a.id);
+    const list = (byPlatform.get(a.id) || []).filter((r) => !scope || r.scope === scope).sort((x, y) => String(x.ts).localeCompare(String(y.ts)));
     const last = list[list.length - 1] || null;
     const lastWithMeta = list.findLast((r) => r.meta && RUN_STATUS.has(r.status));
     const matrix = {};
@@ -133,7 +135,7 @@ export function buildState({ cfg = loadConfig({ createIfMissing: false }), recor
       const completed = dayRecords.findLast((r) => RUN_STATUS.has(r.status));
       matrix[d] = (completed || dayRecords.at(-1))?.status || null;
     }
-    const todayRecords = list.filter((r) => r.date === today());
+    const todayRecords = list.filter((r) => r.date === businessDate(cfg, a.id));
     const todayRec = todayRecords.findLast((r) => RUN_STATUS.has(r.status)) || todayRecords.at(-1) || null;
     const pc = cfg.platforms[a.id] || {};
     // 判定方式：config 里显式 type 优先；否则看是否是客户端接管类适配器
@@ -248,12 +250,18 @@ async function scanClientsCached(cfg) {
  * 本地控制台服务：静态页 + JSON API + SSE 实时日志。
  * 只监听 127.0.0.1，不对外网暴露。
  */
-export async function startServer({ port = 7788, logger } = {}) {
+export async function startServer({ port = 7788, logger, spawnRun = spawn } = {}) {
   const root = process.cwd();
   const webDir = path.join(root, 'web');
   const hub = new Set();
   const sessionToken = randomBytes(32).toString('hex');
   let running = null; // 正在跑的 child process
+  let runState = { status: 'idle', startedAt: null, endedAt: null, only: [], dryRun: false, code: null, summary: null };
+  const taskSnapshot = () => {
+    const locked = fs.existsSync(path.join(root, 'data/.task.lock'));
+    return { ...runState, busy: !!running || !!loginState.proc || locked, locked,
+      externalOrStale: locked && !running && !loginState.proc, login: { id: loginState.id, status: loginState.status } };
+  };
   let clientsCache = { at: 0, data: null };
 
   const logger2 = logger || createLogger('web', { silent: true });
@@ -317,7 +325,7 @@ export async function startServer({ port = 7788, logger } = {}) {
       if (p === '/api/session' && req.method === 'GET') return json(res, 200, { token: sessionToken });
       // ---------- API ----------
       if (p === '/api/state' && req.method === 'GET') {
-        return json(res, 200, buildState());
+        return json(res, 200, { ...buildState(), task: taskSnapshot() });
       }
 
       if (p === '/api/report' && req.method === 'GET') {
@@ -330,7 +338,7 @@ export async function startServer({ port = 7788, logger } = {}) {
       if (p.startsWith('/api/login/') && req.method === 'POST') {
         const id = decodeURIComponent(p.slice('/api/login/'.length));
         if (!resolveAdapters(loadConfig({ createIfMissing: false }), { includeDisabled: true, only: [id] }).length) return json(res, 400, { error: '未知平台' });
-        if (loginState.proc || running) {
+        if (taskSnapshot().busy) {
           return json(res, 409, { error: '已有签到或登录任务在运行，请先完成它' });
         }
         const child = spawn(process.execPath, [path.join('src', 'login-one.js'), id], {
@@ -432,24 +440,27 @@ export async function startServer({ port = 7788, logger } = {}) {
       }
 
       if (p === '/api/run' && req.method === 'POST') {
-        if (running || loginState.proc) return json(res, 409, { error: '已有签到或登录任务在运行，请等它结束' });
+        if (taskSnapshot().busy) return json(res, 409, { error: '已有签到或登录任务在运行，请等它结束' });
         const body = await readBody(req);
         if (body.only !== undefined && (!Array.isArray(body.only) || body.only.some((id) => typeof id !== 'string' || !/^[a-z0-9_-]+$/i.test(id)))) return json(res, 400, { error: 'only 必须是平台 ID 数组' });
         if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') return json(res, 400, { error: 'dryRun 必须为布尔值' });
         const only = Array.isArray(body.only) && body.only.length ? body.only : [];
         const dryRun = !!body.dryRun;
         // readBody 是异步的，必须在 await 后再检查一次，避免两个并发请求同时通过。
-        if (running || loginState.proc) return json(res, 409, { error: '已有签到或登录任务在运行' });
+        if (taskSnapshot().busy) return json(res, 409, { error: '已有签到或登录任务在运行' });
 
         const args = ['src/index.js', 'run', '--skip-if-done'];
         if (only.length) args.push(`--only=${only.join(',')}`);
         if (dryRun) args.push('--dry-run');
 
         logger2.info(`开始运行: node ${args.join(' ')}`);
-        broadcast({ type: 'run-start', only, dryRun });
-
-        const child = spawn(process.execPath, args, { cwd: root, env: { ...process.env } });
+        const child = spawnRun(process.execPath, args, { cwd: root, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
         running = child;
+        runState = { status: 'running', startedAt: new Date().toISOString(), endedAt: null, only, dryRun, code: null, summary: null };
+        broadcast({ type: 'run-start', task: taskSnapshot() });
+        child.on('message', (message) => {
+          if (message?.type === 'run-result') runState.summary = message.summary;
+        });
 
         const pipe = (stream, level) => {
           let buf = '';
@@ -465,13 +476,18 @@ export async function startServer({ port = 7788, logger } = {}) {
         pipe(child.stdout, 'info');
         pipe(child.stderr, 'error');
 
-        child.on('error', (e) => { running = null; broadcast({ type: 'run-end', code: 1 }); logger2.error(e.message); });
-        child.on('close', (code) => {
+        let ended = false;
+        const finish = (code) => {
+          if (ended) return;
+          ended = true;
           running = null;
-          broadcast({ type: 'run-end', code });
+          runState = { ...runState, status: 'finished', code: code ?? 1, endedAt: new Date().toISOString() };
+          broadcast({ type: 'run-end', code: runState.code, task: taskSnapshot(), summary: runState.summary });
           broadcast({ type: 'state' });
-          logger2.info(`运行结束，退出码 ${code}`);
-        });
+          logger2.info(`运行结束，退出码 ${runState.code}`);
+        };
+        child.on('error', (e) => { finish(1); logger2.error(e.message); });
+        child.on('close', finish);
 
         return json(res, 202, { ok: true, started: args.join(' ') });
       }
@@ -483,7 +499,7 @@ export async function startServer({ port = 7788, logger } = {}) {
           Connection: 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
-        res.write(': connected\n\n');
+        res.write(`data: ${JSON.stringify({ type: 'snapshot', task: taskSnapshot() })}\n\n`);
         hub.add(res);
         const ping = setInterval(() => {
           try {

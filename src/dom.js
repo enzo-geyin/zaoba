@@ -141,12 +141,18 @@ export async function findClickables(page, keywords, { maxTextLen = 14 } = {}) {
   );
 }
 
-/** 全页面文本里扫"是否已经签到过 / 是否成功" */
-export function classifyOutcome(text) {
+/** 成功证据必须明确；点击后的判断只接受相对点击前新增的信号，冲突时失败优先。 */
+export function classifyOutcome(text, { before } = {}) {
   const t = norm(text);
-  const already = /(今日已签到|今日已签|已经签到|已签到|已领取|今天已领|明天再来|明日再来|签到已完成|今日签到已完成)/.test(t);
-  const success = /(签到成功|领取成功|签到完成|领取完成|获得|已到账|签到获得)/.test(t);
+  const previous = before === undefined ? null : norm(before);
+  const fresh = (pattern) => {
+    const hits = t.match(pattern) || [];
+    const old = previous === null ? [] : previous.match(pattern) || [];
+    return hits.some((hit) => hits.filter((x) => x === hit).length > old.filter((x) => x === hit).length);
+  };
   const fail = /(签到失败|领取失败|操作失败|系统繁忙|请稍后|网络异常|重复签到|已经领过)/.test(t);
+  const already = !fail && fresh(/今日已签到|今日已签|今天已领|今日已领|明天再来|明日再来|今日签到已完成/g);
+  const success = !fail && fresh(/签到成功|领取成功|签到完成|领取完成/g);
   return { already, success, fail };
 }
 
@@ -215,12 +221,11 @@ export async function clickByKeywords(page, keywords, logger, { label = '' } = {
 
     await sleep(1200 + Math.random() * 800);
     const after = await pageText(page, 4000);
-    const outcome = classifyOutcome(after);
+    const outcome = classifyOutcome(after, { before });
     const changed = after !== before;
 
-    if (outcome.already || outcome.success || outcome.fail || changed) {
-      return { clicked: true, text: c.text, outcome, changed };
-    }
+    // 已经尝试提交但没有明确证据时交给上层报告待确认，不盲点第二个候选重复提交。
+    return { clicked: true, text: c.text, outcome, changed };
   }
 
   // 主框架没找到时，尝试 iframe 内的文本
@@ -230,10 +235,11 @@ export async function clickByKeywords(page, keywords, logger, { label = '' } = {
       try {
         const loc = frame.getByText(new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).first();
         if (await loc.isVisible({ timeout: 800 })) {
+          const before = await pageText(page, 4000);
           await loc.click({ timeout: 3000 });
           await sleep(1200);
           const after = await pageText(page, 4000);
-          return { clicked: true, text: `[iframe] ${k}`, outcome: classifyOutcome(after), changed: true };
+          return { clicked: true, text: `[iframe] ${k}`, outcome: classifyOutcome(after, { before }), changed: after !== before };
         }
       } catch {
         /* 继续找 */
@@ -241,7 +247,7 @@ export async function clickByKeywords(page, keywords, logger, { label = '' } = {
     }
   }
 
-  return { clicked: false, text: null, outcome: classifyOutcome(await pageText(page, 4000)), changed: false, tried };
+  return { clicked: false, text: null, outcome: { already: false, success: false, fail: false }, changed: false, tried };
 }
 
 /** 打开页面并等到基本可交互（domcontentloaded + 少量 settle） */

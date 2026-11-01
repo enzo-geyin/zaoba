@@ -61,9 +61,11 @@ export async function genericCheckin(adapter, page, ctx, logger, cfg = {}) {
     }
 
     // 已完成判定（幂等保护）
-    const doneHit = adapter.doneKeywords.find((k) => text.includes(k));
-    const cls = classifyOutcome(text);
-    if (doneHit || cls.already) {
+    // 全页历史记录可能含“今日已签到”；只有显式签到状态容器可证明当前状态。
+    const stateText = adapter.statusSelector ? await page.locator(adapter.statusSelector).innerText().catch(() => '') : '';
+    const cls = classifyOutcome(stateText);
+    const doneHit = cls.already ? '当日已完成状态' : null;
+    if (cls.already) {
       logger.ok(`今天已完成（页面显示"${doneHit || '已签到/已领取'}"）`);
       return { status: 'already', detail: doneHit || '页面显示今日已完成', url: page.url() };
     }

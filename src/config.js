@@ -26,7 +26,7 @@ import { readJSON, writeJSON } from './util.js';
 export const CONFIG_FILE = path.resolve('config.json');
 
 /** 只有这几个字段允许被 config.json 覆盖，避免用户误写导致适配器坏掉 */
-const OVERRIDABLE = ['homepage', 'loginUrl', 'entryUrls', 'keywords', 'doneKeywords', 'api', 'notes'];
+const OVERRIDABLE = ['homepage', 'loginUrl', 'entryUrls', 'keywords', 'doneKeywords', 'statusSelector', 'api', 'notes'];
 
 const DEFAULT_KEYWORDS = ['签到', '每日签到', '立即签到', '打卡', '领取', '立即领取'];
 
@@ -239,6 +239,7 @@ export function resolveAdapters(cfg, { only = [], includeDisabled = false } = {}
       entryUrls: Array.isArray(pc.entryUrls) && pc.entryUrls.length ? pc.entryUrls : [url],
       keywords: Array.isArray(pc.keywords) && pc.keywords.length ? pc.keywords : DEFAULT_KEYWORDS,
       doneKeywords: Array.isArray(pc.doneKeywords) && pc.doneKeywords.length ? pc.doneKeywords : DEFAULT_DONE,
+      statusSelector: pc.statusSelector,
       api: null,
       custom: null,
       notes: pc.notes || '自定义平台（config.json 里配置）',
