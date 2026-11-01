@@ -63,7 +63,15 @@ echo "✓ WorkBuddy 调试端口持久化已安装（${ENV_LABEL}）"
 
 # ---------- 3) 常驻可视化控制台 ----------
 NODE_BIN="$(command -v node)"
+WEB_PORT="7788"
 WEB_PLIST="$HOME/Library/LaunchAgents/$WEB_LABEL.plist"
+
+# 端口被占用时 KeepAlive 会让服务反复重启，先把原因说清楚
+if lsof -nP -iTCP:"$WEB_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  HOLDER="$(lsof -nP -iTCP:"$WEB_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{printf "%s (PID %s)", $1, $2}')"
+  echo "! 端口 ${WEB_PORT} 已被占用：${HOLDER}"
+  echo "  常驻控制台会因此反复重启。若它不是本项目控制台，请先结束该进程再重跑本脚本。"
+fi
 cat > "$WEB_PLIST" <<WEBEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -75,11 +83,12 @@ cat > "$WEB_PLIST" <<WEBEOF
     <string>${NODE_BIN}</string>
     <string>${PROJECT_DIR}/src/index.js</string>
     <string>web</string>
-    <string>--port=7788</string>
+    <string>--port=${WEB_PORT}</string>
   </array>
   <key>WorkingDirectory</key><string>${PROJECT_DIR}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${PROJECT_DIR}/data/log/web.out.log</string>
   <key>StandardErrorPath</key><string>${PROJECT_DIR}/data/log/web.err.log</string>
 </dict>
@@ -88,11 +97,17 @@ WEBEOF
 plutil -lint "$WEB_PLIST" >/dev/null
 launchctl bootout "gui/$UID_NUM/$WEB_LABEL" 2>/dev/null || true
 sleep 1
+# bootout 是异步的，紧跟着 bootstrap 可能被拒；静置后重试一次，并以系统回读为准
 launchctl bootstrap "gui/$UID_NUM" "$WEB_PLIST" 2>/dev/null || {
-  sleep 2
-  launchctl bootstrap "gui/$UID_NUM" "$WEB_PLIST" 2>/dev/null || launchctl kickstart -k "gui/$UID_NUM/$WEB_LABEL" 2>/dev/null || true
+  sleep 12
+  launchctl bootstrap "gui/$UID_NUM" "$WEB_PLIST" 2>/dev/null || true
 }
-echo "✓ 可视化控制台已设为常驻: http://127.0.0.1:7788"
+if launchctl print "gui/$UID_NUM/$WEB_LABEL" >/dev/null 2>&1; then
+  echo "✓ 可视化控制台已设为常驻: http://127.0.0.1:${WEB_PORT}（已确认系统已加载）"
+else
+  echo "! 未能确认控制台常驻服务已加载，请手动执行："
+  echo "    launchctl bootstrap gui/$UID_NUM $WEB_PLIST"
+fi
 
 echo ""
 echo "✓ 安装完成"

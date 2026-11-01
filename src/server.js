@@ -534,10 +534,25 @@ export async function startServer({ port = 7788, logger, spawnRun = spawn } = {}
     }
   });
 
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', resolve);
+    });
+  } catch (e) {
+    if (e?.code === 'EADDRINUSE') {
+      // 常驻服务（KeepAlive）遇到端口冲突会不停重启；这里把原因说清楚，
+      // 并让调用方能以特定退出码区分"端口冲突"和真正的启动失败。
+      const err = new Error(
+        `端口 ${port} 已被占用，可能已有控制台在运行（${`http://127.0.0.1:${port}`}）。` +
+          '请先结束占用该端口的进程，或换一个端口启动。',
+      );
+      err.code = 'EADDRINUSE';
+      err.port = port;
+      throw err;
+    }
+    throw e;
+  }
 
   const addr = server.address();
   const url = `http://127.0.0.1:${addr.port}`;
