@@ -123,9 +123,25 @@ fi
 step 4 "浏览器内核（首次约 570MB，可复用系统浏览器省掉）"
 BROWSER_CACHE="${HOME}/Library/Caches/ms-playwright"
 
-# 全新安装（还没有 profile/）时，优先复用系统 Chrome / Edge，省 570MB
+read_config_channel() {
+  [ -f config.json ] || return 1
+  node -e '
+    try {
+      const c = JSON.parse(require("fs").readFileSync("config.json", "utf8"));
+      if (typeof c.channel === "string" && c.channel) process.exit(0);
+    } catch {}
+    process.exit(1);
+  ' && node -e '
+    const c = JSON.parse(require("fs").readFileSync("config.json", "utf8"));
+    process.stdout.write(c.channel);
+  '
+}
+
+# 优先级：config.json 已配置的 channel > 全新安装检测系统浏览器 > 下载内核
 SYSTEM_CHANNEL=""
-if [ "${FORCE_BROWSER:-0}" != "1" ] && [ ! -d "$PROJECT_DIR/profile" ]; then
+if CHANNEL_FROM_CONFIG="$(read_config_channel)"; then
+  SYSTEM_CHANNEL="${CHANNEL_FROM_CONFIG}"
+elif [ "${FORCE_BROWSER:-0}" != "1" ] && [ ! -d "$PROJECT_DIR/profile" ]; then
   if [ -d "/Applications/Google Chrome.app" ]; then
     SYSTEM_CHANNEL="chrome"
   elif [ -d "/Applications/Microsoft Edge.app" ]; then
@@ -134,10 +150,21 @@ if [ "${FORCE_BROWSER:-0}" != "1" ] && [ ! -d "$PROJECT_DIR/profile" ]; then
 fi
 
 if [ -n "${SYSTEM_CHANNEL}" ]; then
+  if [ "$SYSTEM_CHANNEL" = "chrome" ] && [ ! -d "/Applications/Google Chrome.app" ]; then
+    warn "config.json 指定 channel: chrome，但没有找到 /Applications/Google Chrome.app"
+    SYSTEM_CHANNEL=""
+  elif [ "$SYSTEM_CHANNEL" = "msedge" ] && [ ! -d "/Applications/Microsoft Edge.app" ]; then
+    warn "config.json 指定 channel: msedge，但没有找到 /Applications/Microsoft Edge.app"
+    SYSTEM_CHANNEL=""
+  fi
+fi
+
+if [ -n "${SYSTEM_CHANNEL}" ]; then
   if [ "$CHECK_ONLY" = 1 ]; then
-    ok "检测到系统浏览器，可复用它（channel: ${SYSTEM_CHANNEL}），无需下载 570MB"
+    ok "将复用系统浏览器（channel: ${SYSTEM_CHANNEL}），无需下载 570MB"
+  elif [ "${CHANNEL_FROM_CONFIG:-}" = "$SYSTEM_CHANNEL" ]; then
+    ok "config.json 已配置复用系统浏览器（channel: ${SYSTEM_CHANNEL}），跳过 570MB 下载"
   else
-    ( cd "$PROJECT_DIR" && [ -f config.json ] || node src/index.js list >/dev/null 2>&1 )
     node -e '
       const fs = require("fs");
       const f = "config.json";
@@ -153,10 +180,11 @@ elif [ -d "$BROWSER_CACHE" ] && [ -n "$(ls -A "$BROWSER_CACHE" 2>/dev/null)" ]; 
 elif [ "$SKIP_BROWSER" = 1 ]; then
   warn "已跳过下载（网页类平台将不可用；客户端类平台不受影响）"
 elif [ "$CHECK_ONLY" = 1 ]; then
-  fail "缺少浏览器内核，需要执行 npx playwright install chromium"
+  fail "缺少浏览器内核，需要执行 node node_modules/playwright/cli.js install chromium"
 else
   echo "  → 下载中，约 570MB，取决于网速"
-  npx playwright install chromium
+  # 不依赖 npx/全局命令，直接用项目内安装的 playwright 模块
+  node node_modules/playwright/cli.js install chromium
   ok "浏览器内核安装完成"
 fi
 

@@ -49,10 +49,36 @@ else { npm install --no-audit --no-fund; Ok "依赖安装完成" }
 Step 4 "浏览器内核（首次约 570MB，可复用系统浏览器省掉）"
 $cache = Join-Path $env:LOCALAPPDATA 'ms-playwright'
 
-# 全新安装时优先复用系统 Edge / Chrome（Windows 自带 Edge）
+# 优先级：config.json 已配置的 channel > 全新安装检测系统浏览器 > 下载内核
 $systemChannel = ''
-$freshInstall = -not (Test-Path 'profile')
-if ($freshInstall -and -not $ForceBrowser) {
+$channelFromConfig = $null
+if (Test-Path 'config.json') {
+  try {
+    $existing = Get-Content 'config.json' -Raw | ConvertFrom-Json
+    if ($existing.channel -and $existing.channel -is [string]) { $channelFromConfig = [string]$existing.channel }
+  } catch {}
+}
+if ($channelFromConfig) {
+  $systemChannel = $channelFromConfig
+  # 配置指定了 channel 但对应浏览器不存在时，放弃该 channel，交给后续下载逻辑
+  $browserMissing = $false
+  if ($systemChannel -eq 'chrome') {
+    $browserMissing = -not (@(
+      (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+      (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+      (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) })
+  } elseif ($systemChannel -eq 'msedge') {
+    $browserMissing = -not (@(
+      (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+      (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) })
+  }
+  if ($browserMissing) {
+    Warn "config.json 指定 channel: $systemChannel，但没有找到对应浏览器，改为使用内置内核"
+    $systemChannel = ''
+  }
+} elseif (-not (Test-Path 'profile') -and -not $ForceBrowser) {
   $edgePaths = @(
     (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
     (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
@@ -67,7 +93,9 @@ if ($freshInstall -and -not $ForceBrowser) {
 
 if ($systemChannel) {
   if ($Check) {
-    Ok "检测到系统浏览器，可复用它（channel: $systemChannel），无需下载 570MB"
+    Ok "将复用系统浏览器（channel: $systemChannel），无需下载 570MB"
+  } elseif ($channelFromConfig -eq $systemChannel) {
+    Ok "config.json 已配置复用系统浏览器（channel: $systemChannel），跳过 570MB 下载"
   } else {
     if (-not (Test-Path 'config.json')) { node src/index.js list | Out-Null }
     $cfg = Get-Content 'config.json' -Raw | ConvertFrom-Json
@@ -81,10 +109,11 @@ if ($systemChannel) {
 } elseif ($SkipBrowser) {
   Warn "已跳过下载（网页类平台不可用；客户端类平台不受影响）"
 } elseif ($Check) {
-  Fail "缺少浏览器内核，需要执行 npx playwright install chromium"
+  Fail "缺少浏览器内核，需要执行 node node_modules/playwright/cli.js install chromium"
 } else {
   Write-Host "  → 下载中，约 570MB"
-  npx playwright install chromium
+  # 不依赖 npx/全局命令，直接用项目内安装的 playwright 模块
+  node node_modules/playwright/cli.js install chromium
   Ok "浏览器内核安装完成"
 }
 
