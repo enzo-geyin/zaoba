@@ -125,8 +125,10 @@ export default defineAdapter({
           status: 'needs_manual',
           detail:
             `WorkBuddy 正在运行但没有开启调试端口（${port}）。` +
-            '请先完全退出 WorkBuddy（菜单栏 → 退出）后重跑，或手动执行：' +
-            `env -u ELECTRON_RUN_AS_NODE WORKBUDDY_REMOTE_DEBUGGING_PORT=${port} "${execPath || '<WorkBuddy 可执行文件>'}"`,
+            '环境变量只在启动时生效，应用内“重启/更新”会继承旧进程环境，无效。' +
+            '正确做法：⌘Q 完全退出（确认无残留进程）后，从访达/启动台重新打开。' +
+            `若重启后仍无效，先在 Terminal 执行 scripts/set-workbuddy-debug.sh 确认变量已设置；` +
+            `也可手动执行：env -u ELECTRON_RUN_AS_NODE WORKBUDDY_REMOTE_DEBUGGING_PORT=${port} "${execPath || '<WorkBuddy 可执行文件>'}"`,
         };
       }
       launchedPid = await launchWithDebug(port, logger, execPath);
